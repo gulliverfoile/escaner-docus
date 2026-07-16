@@ -1,141 +1,440 @@
 <!DOCTYPE html>
-<html>
+<html lang="es">
 <head>
-    <title>Escáner MVP con Diagnóstico</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>Escáner de documentos</title>
+    <link rel="manifest" href="manifest.json">
     <style>
-        body { font-family: sans-serif; margin: 10px; }
-        #video { width: 100%; max-width: 640px; display: block; background: #eee; }
-        canvas { display: none; }
-        .controls { margin: 10px 0; }
-        #status { padding: 10px; background: #f8f8f8; border: 1px solid #ccc; margin-bottom: 10px; }
-        .error { color: red; }
-        .ok { color: green; }
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: system-ui, -apple-system, sans-serif; background: #f5f5f5; color: #222; }
+        .app { max-width: 720px; margin: 0 auto; padding: 1rem; }
+        .header { text-align: center; margin-bottom: 0.5rem; }
+        .header h1 { font-size: 1.5rem; font-weight: 600; }
+        .viewfinder { position: relative; background: #000; border-radius: 12px; overflow: hidden; aspect-ratio: 4/3; }
+        .viewfinder video, .viewfinder canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; object-fit: contain; }
+        .viewfinder canvas { z-index: 2; } /* capa de previsualización filtrada */
+        .controls { margin-top: 1rem; display: flex; flex-direction: column; gap: 0.8rem; }
+        .slider-group { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
+        .slider-group label { font-size: 0.9rem; min-width: 80px; }
+        .slider-group input[type=range] { flex: 1; min-width: 150px; }
+        .slider-group span { font-weight: bold; min-width: 3ch; display: inline-block; }
+        .button-group { display: flex; gap: 0.5rem; justify-content: center; }
+        button { padding: 0.7rem 1.2rem; border: none; border-radius: 8px; font-size: 1rem; cursor: pointer; background: #007aff; color: white; font-weight: 500; transition: background 0.2s; }
+        button:disabled { background: #aaa; cursor: not-allowed; }
+        button.secondary { background: #e0e0e0; color: #333; }
+        .result { margin-top: 1rem; }
+        .result img { width: 100%; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); display: none; }
+        .result a { display: none; margin-top: 0.5rem; color: #007aff; text-decoration: none; font-weight: 500; }
+        .status { padding: 0.5rem; background: #fff; border-radius: 8px; font-size: 0.9rem; text-align: center; }
+        .status.error { color: #d32f2f; }
+        .status.ok { color: #2e7d32; }
     </style>
 </head>
 <body>
-    <div id="status">Comprobando acceso a cámara...</div>
-    <video id="video" autoplay playsinline></video>
-    <div class="controls">
-        <button id="captureBtn" disabled>Capturar y Procesar</button>
+    <div class="app">
+        <div class="header"><h1>Escáner Inteligente</h1></div>
+        <div id="status" class="status">Iniciando...</div>
+        <div class="viewfinder" id="viewfinder">
+            <video id="video" autoplay playsinline muted></video>
+            <canvas id="previewCanvas"></canvas>
+        </div>
+        <div class="controls">
+            <div class="slider-group">
+                <label for="thresholdSlider">Sensibilidad:</label>
+                <input type="range" id="thresholdSlider" min="80" max="180" value="120" step="1">
+                <span id="thresholdValue">120</span>
+            </div>
+            <div class="button-group">
+                <button id="captureBtn" disabled>📸 Capturar</button>
+                <button id="downloadBtn" class="secondary" disabled>⬇️ Descargar PNG</button>
+            </div>
+        </div>
+        <div class="result">
+            <img id="resultImage" alt="Documento procesado">
+            <a id="downloadLink" href="#" download="documento.png">Descargar PNG</a>
+        </div>
     </div>
-    <canvas id="outputCanvas"></canvas>
-    <img id="result" style="max-width: 640px; display: block; margin-top: 10px;" />
-    <a id="downloadLink" style="display:none">Descargar PNG</a>
 
     <script>
-        const statusDiv = document.getElementById('status');
-        const video = document.getElementById('video');
-        const captureBtn = document.getElementById('captureBtn');
-        const outputCanvas = document.getElementById('outputCanvas');
-        const resultImg = document.getElementById('result');
-        const downloadLink = document.getElementById('downloadLink');
+    /**
+     * Escáner de Documentos - Arquitectura Modular por Eventos
+     * 
+     * Módulos:
+     * 1. CameraService   -> Gestiona la cámara, emite frames.
+     * 2. ImageProcessor  -> Procesa imágenes, recibe ImageData y parámetros, devuelve ImageData procesado.
+     * 3. UIController    -> Orquesta la interfaz y conecta los módulos.
+     * 
+     * Comunicación: EventEmitter personalizado (patrón Observer) para desacoplar.
+     * Preparado para migrar a hexagonal: los puertos serían las interfaces de CameraService e ImageProcessor,
+     * los adaptadores serían la implementación actual concreta (navegador). La lógica de negocio (procesado)
+     * no depende de la UI.
+     */
 
-        function updateStatus(msg, isError = false) {
-            statusDiv.innerHTML = msg;
-            statusDiv.className = isError ? 'error' : 'ok';
+    /* ========== MICRO EVENT EMITTER ========== */
+    class EventEmitter {
+        constructor() { this._events = {}; }
+        on(event, listener) {
+            if (!this._events[event]) this._events[event] = [];
+            this._events[event].push(listener);
+            return this;
+        }
+        off(event, listener) {
+            if (!this._events[event]) return;
+            this._events[event] = this._events[event].filter(l => l !== listener);
+        }
+        emit(event, ...args) {
+            if (!this._events[event]) return;
+            this._events[event].forEach(l => l(...args));
+        }
+    }
+
+    /* ========== CAMERA SERVICE ========== */
+    class CameraService extends EventEmitter {
+        constructor() {
+            super();
+            this.stream = null;
+            this.videoElement = null;
+            this._animationFrameId = null;
+            this._facingMode = 'environment'; // cámara trasera
         }
 
-        // Verificar si el contexto es seguro (HTTPS o localhost)
-        if (window.location.protocol === 'https:' || window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') {
-            updateStatus('Contexto seguro ✅. Solicitando cámara...');
-        } else {
-            updateStatus('⚠️ Contexto NO seguro (HTTP). La cámara solo funciona en HTTPS o localhost. Abre con un servidor HTTPS (ver instrucciones).', true);
-            // Ocultamos el video para no confundir
-            video.style.display = 'none';
-        }
-
-        async function startCamera() {
+        /**
+         * Inicia la cámara y asigna el stream al elemento <video> proporcionado.
+         * @param {HTMLVideoElement} videoElement 
+         */
+        async start(videoElement) {
+            this.videoElement = videoElement;
             try {
-                const stream = await navigator.mediaDevices.getUserMedia({
-                    video: { 
-                        facingMode: "environment", 
-                        width: { ideal: 1280 }, 
-                        height: { ideal: 720 } 
-                    }
+                this.stream = await navigator.mediaDevices.getUserMedia({
+                    video: {
+                        facingMode: { ideal: this._facingMode },
+                        width: { ideal: 1280 },
+                        height: { ideal: 720 }
+                    },
+                    audio: false
                 });
-                video.srcObject = stream;
-                video.play();
-                captureBtn.disabled = false;
-                updateStatus('Cámara activa 📸. Coloca el documento y pulsa Capturar.');
-            } catch (err) {
-                captureBtn.disabled = true;
-                let errorMsg = '';
-                if (err.name === 'NotAllowedError') {
-                    errorMsg = '❌ Permiso denegado. Debes permitir el acceso a la cámara en los ajustes del navegador.';
-                } else if (err.name === 'NotFoundError') {
-                    errorMsg = '❌ No se encontró ninguna cámara. ¿Tiene cámara este dispositivo?';
-                } else if (err.name === 'NotReadableError') {
-                    errorMsg = '❌ La cámara está siendo usada por otra aplicación.';
-                } else {
-                    errorMsg = '❌ Error inesperado: ' + err.message;
-                }
-                updateStatus(errorMsg, true);
+                this.videoElement.srcObject = this.stream;
+                await this.videoElement.play();
+                this._startFrameLoop();
+                this.emit('ready');
+            } catch (error) {
+                this.emit('error', error);
             }
         }
 
-        // Procesamiento (igual que antes)
-        function processImage(videoElement) {
-            const tempCanvas = document.createElement('canvas');
-            tempCanvas.width = videoElement.videoWidth;
-            tempCanvas.height = videoElement.videoHeight;
-            const tempCtx = tempCanvas.getContext('2d');
-            tempCtx.drawImage(videoElement, 0, 0);
-            const imageData = tempCtx.getImageData(0, 0, tempCanvas.width, tempCanvas.height);
-            const data = imageData.data;
-            const gray = new Uint8Array(imageData.width * imageData.height);
+        _startFrameLoop() {
+            const emitFrame = () => {
+                if (!this.videoElement || this.videoElement.readyState < 2) {
+                    this._animationFrameId = requestAnimationFrame(emitFrame);
+                    return;
+                }
+                this.emit('frame', this.videoElement);
+                this._animationFrameId = requestAnimationFrame(emitFrame);
+            };
+            emitFrame();
+        }
+
+        stop() {
+            if (this._animationFrameId) cancelAnimationFrame(this._animationFrameId);
+            if (this.stream) {
+                this.stream.getTracks().forEach(track => track.stop());
+                this.stream = null;
+            }
+            if (this.videoElement) this.videoElement.srcObject = null;
+            this.emit('stop');
+        }
+
+        /**
+         * Captura el frame actual como ImageData.
+         * @returns {ImageData}
+         */
+        captureFrame() {
+            if (!this.videoElement) throw new Error('Video no inicializado');
+            const canvas = document.createElement('canvas');
+            canvas.width = this.videoElement.videoWidth;
+            canvas.height = this.videoElement.videoHeight;
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(this.videoElement, 0, 0);
+            return ctx.getImageData(0, 0, canvas.width, canvas.height);
+        }
+    }
+
+    /* ========== IMAGE PROCESSOR ========== */
+    /**
+     * Procesa una imagen a blanco y negro con normalización de iluminación.
+     * Parámetros configurables: threshold (umbral global)
+     */
+    class ImageProcessor {
+        /**
+         * @param {ImageData} imageData - imagen original
+         * @param {number} threshold - umbral (0-255), valores bajos = más negro
+         * @returns {ImageData} imagen procesada (fondo blanco puro, texto negro puro)
+         */
+        static process(imageData, threshold = 120) {
+            const { data, width, height } = imageData;
+            // 1. Escala de grises float
+            const gray = new Float32Array(width * height);
             for (let i = 0; i < data.length; i += 4) {
-                gray[i/4] = Math.round(0.299*data[i] + 0.587*data[i+1] + 0.114*data[i+2]);
+                // Fórmula de luminosidad perceptual
+                gray[i >> 2] = 0.299 * data[i] + 0.587 * data[i+1] + 0.114 * data[i+2];
             }
-            const width = imageData.width, height = imageData.height;
-            const blockSize = 15, C = -2;
-            const half = Math.floor(blockSize/2);
-            const integral = new Int32Array(width * height);
+
+            // 2. Iluminación local con box blur grande (integral)
+            const blurSize = 41; // debe ser impar
+            const halfB = (blurSize - 1) / 2;
+            const integral = new Float64Array(width * height);
+            // Construir imagen integral
             for (let y = 0; y < height; y++) {
-                let sum = 0;
+                let rowSum = 0;
                 for (let x = 0; x < width; x++) {
-                    sum += gray[y*width + x];
-                    if (y === 0) integral[y*width + x] = sum;
-                    else integral[y*width + x] = integral[(y-1)*width + x] + sum;
+                    rowSum += gray[y * width + x];
+                    if (y === 0) {
+                        integral[y * width + x] = rowSum;
+                    } else {
+                        integral[y * width + x] = integral[(y - 1) * width + x] + rowSum;
+                    }
                 }
             }
+            // Calcular media local usando integral
+            const blurred = new Float32Array(width * height);
             for (let y = 0; y < height; y++) {
                 for (let x = 0; x < width; x++) {
-                    const x1 = Math.max(x - half, 0), y1 = Math.max(y - half, 0);
-                    const x2 = Math.min(x + half, width-1), y2 = Math.min(y + half, height-1);
-                    let sum = integral[y2*width + x2];
-                    if (y1 > 0) sum -= integral[(y1-1)*width + x2];
-                    if (x1 > 0) sum -= integral[y2*width + (x1-1)];
-                    if (y1 > 0 && x1 > 0) sum += integral[(y1-1)*width + (x1-1)];
+                    const x1 = Math.max(x - halfB, 0);
+                    const y1 = Math.max(y - halfB, 0);
+                    const x2 = Math.min(x + halfB, width - 1);
+                    const y2 = Math.min(y + halfB, height - 1);
+                    let sum = integral[y2 * width + x2];
+                    if (y1 > 0) sum -= integral[(y1 - 1) * width + x2];
+                    if (x1 > 0) sum -= integral[y2 * width + (x1 - 1)];
+                    if (y1 > 0 && x1 > 0) sum += integral[(y1 - 1) * width + (x1 - 1)];
                     const area = (x2 - x1 + 1) * (y2 - y1 + 1);
-                    const mean = sum / area;
-                    const threshold = mean + C;
-                    const idx = (y*width + x) * 4;
-                    const val = gray[y*width + x] > threshold ? 255 : 0;
-                    data[idx] = val;
-                    data[idx+1] = val;
-                    data[idx+2] = val;
+                    blurred[y * width + x] = sum / area;
                 }
             }
-            outputCanvas.width = width;
-            outputCanvas.height = height;
-            const outCtx = outputCanvas.getContext('2d');
-            outCtx.putImageData(imageData, 0, 0);
-            const dataURL = outputCanvas.toDataURL('image/png');
-            resultImg.src = dataURL;
-            downloadLink.href = dataURL;
-            downloadLink.download = 'documento.png';
-            downloadLink.style.display = 'inline';
+
+            // 3. Normalizar iluminación: dividir gris por el fondo + pequeño offset
+            const normalized = new Float32Array(width * height);
+            for (let i = 0; i < normalized.length; i++) {
+                // Evitar división por cero y saturar
+                const divisor = blurred[i] + 0.001;
+                normalized[i] = Math.min(255, (gray[i] / divisor) * 255);
+            }
+
+            // 4. Umbral global y construcción de imagen de salida
+            const outputData = new Uint8ClampedArray(data.length);
+            for (let i = 0; i < data.length; i += 4) {
+                const pixelVal = normalized[i >> 2];
+                const binary = pixelVal < threshold ? 0 : 255;
+                outputData[i] = binary;
+                outputData[i+1] = binary;
+                outputData[i+2] = binary;
+                outputData[i+3] = 255; // alpha
+            }
+
+            // 5. Filtro de mediana 3x3 para eliminar ruido (sal y pimienta)
+            const cleanData = this._medianFilter(outputData, width, height);
+
+            return new ImageData(cleanData, width, height);
         }
 
-        captureBtn.addEventListener('click', () => {
-            processImage(video);
-        });
-
-        // Solo intentar iniciar la cámara si el contexto es seguro
-        if (window.location.protocol === 'https:' || window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') {
-            startCamera();
+        /**
+         * Filtro de mediana 3x3 para imágenes binarias.
+         * @param {Uint8ClampedArray} binaryData - datos en formato RGBA (binarizados)
+         * @param {number} width 
+         * @param {number} height 
+         * @returns {Uint8ClampedArray} datos filtrados
+         */
+        static _medianFilter(binaryData, width, height) {
+            const result = new Uint8ClampedArray(binaryData.length);
+            // Copiar bordes sin filtrar
+            for (let i = 0; i < binaryData.length; i++) result[i] = binaryData[i];
+            // Vecindad 3x3
+            const neighbors = new Array(9);
+            for (let y = 1; y < height - 1; y++) {
+                for (let x = 1; x < width - 1; x++) {
+                    let idx = 0;
+                    for (let dy = -1; dy <= 1; dy++) {
+                        for (let dx = -1; dx <= 1; dx++) {
+                            const pixelIndex = ((y + dy) * width + (x + dx)) * 4;
+                            neighbors[idx++] = binaryData[pixelIndex]; // solo R, asumimos R=G=B
+                        }
+                    }
+                    // Contar blancos (255) en vecindario
+                    const whiteCount = neighbors.filter(v => v === 255).length;
+                    const median = whiteCount >= 5 ? 255 : 0;
+                    const centerIdx = (y * width + x) * 4;
+                    result[centerIdx] = median;
+                    result[centerIdx + 1] = median;
+                    result[centerIdx + 2] = median;
+                }
+            }
+            return result;
         }
+    }
+
+    /* ========== UI CONTROLLER (orquestador) ========== */
+    class UIController {
+        constructor() {
+            // Elementos DOM
+            this.statusDiv = document.getElementById('status');
+            this.video = document.getElementById('video');
+            this.previewCanvas = document.getElementById('previewCanvas');
+            this.previewCtx = this.previewCanvas.getContext('2d');
+            this.captureBtn = document.getElementById('captureBtn');
+            this.downloadBtn = document.getElementById('downloadBtn');
+            this.downloadLink = document.getElementById('downloadLink');
+            this.resultImage = document.getElementById('resultImage');
+            this.thresholdSlider = document.getElementById('thresholdSlider');
+            this.thresholdValue = document.getElementById('thresholdValue');
+
+            // Servicios
+            this.cameraService = new CameraService();
+            this.isCameraReady = false;
+            this.lastFrameImageData = null; // almacena el último frame para captura
+
+            // Estado
+            this.currentThreshold = parseInt(this.thresholdSlider.value, 10);
+
+            // Bind eventos de UI
+            this.captureBtn.addEventListener('click', () => this.onCapture());
+            this.thresholdSlider.addEventListener('input', (e) => {
+                this.currentThreshold = parseInt(e.target.value, 10);
+                this.thresholdValue.textContent = this.currentThreshold;
+                // Actualizar previsualización en vivo (no es necesario volver a procesar, se hace en el loop)
+            });
+
+            // Registrar eventos del servicio de cámara
+            this.cameraService.on('ready', () => this.onCameraReady());
+            this.cameraService.on('frame', (videoEl) => this.onFrame(videoEl));
+            this.cameraService.on('error', (error) => this.onCameraError(error));
+            this.cameraService.on('stop', () => this.onCameraStop());
+        }
+
+        /**
+         * Inicia la aplicación.
+         */
+        async init() {
+            this.setStatus('Solicitando cámara...', 'ok');
+            try {
+                await this.cameraService.start(this.video);
+            } catch (e) {
+                // Error ya gestionado en onCameraError
+            }
+        }
+
+        onCameraReady() {
+            this.isCameraReady = true;
+            this.captureBtn.disabled = false;
+            this.setStatus('Cámara lista. Ajusta sensibilidad y captura.', 'ok');
+            // Ajustar tamaño del canvas de previsualización al tamaño real del vídeo
+            this.previewCanvas.width = this.video.videoWidth;
+            this.previewCanvas.height = this.video.videoHeight;
+        }
+
+        onFrame(videoElement) {
+            if (!this.isCameraReady) return;
+            // Dibujar frame sin procesar en el canvas de previsualización (lo haremos abajo)
+            // Para aplicar filtro en vivo, necesitamos el ImageData.
+            // Por rendimiento, solo procesamos si ha cambiado el vídeo (requestAnimationFrame ya controla).
+            // Capturamos frame y procesamos con el umbral actual para pintar en el canvas de previsualización.
+            const imageData = this.cameraService.captureFrame();
+            this.lastFrameImageData = imageData; // guardamos para captura final
+            const processed = ImageProcessor.process(imageData, this.currentThreshold);
+            this.previewCtx.putImageData(processed, 0, 0);
+        }
+
+        onCapture() {
+            if (!this.lastFrameImageData) {
+                this.setStatus('No hay imagen para capturar.', 'error');
+                return;
+            }
+            // Procesar con el umbral actual (ya lo tenemos en lastFrameImageData, pero podemos reprocesar para asegurar)
+            const processed = ImageProcessor.process(this.lastFrameImageData, this.currentThreshold);
+            // Mostrar resultado
+            const resultCanvas = document.createElement('canvas');
+            resultCanvas.width = processed.width;
+            resultCanvas.height = processed.height;
+            resultCanvas.getContext('2d').putImageData(processed, 0, 0);
+            const dataURL = resultCanvas.toDataURL('image/png');
+            this.resultImage.src = dataURL;
+            this.resultImage.style.display = 'block';
+            this.downloadLink.href = dataURL;
+            this.downloadLink.style.display = 'inline';
+            this.downloadBtn.disabled = false;
+            this.setStatus('¡Documento procesado!', 'ok');
+        }
+
+        onCameraError(error) {
+            this.isCameraReady = false;
+            let msg = '';
+            if (error.name === 'NotAllowedError') msg = 'Permiso de cámara denegado. Actívalo en ajustes.';
+            else if (error.name === 'NotFoundError') msg = 'No se encontró cámara.';
+            else if (error.name === 'NotReadableError') msg = 'Cámara ocupada.';
+            else msg = `Error: ${error.message}`;
+            this.setStatus(msg, 'error');
+            // Modo simulación: cargar una imagen estática para pruebas
+            this.enterSimulationMode();
+        }
+
+        onCameraStop() {
+            this.isCameraReady = false;
+            this.captureBtn.disabled = true;
+            this.setStatus('Cámara detenida.', 'error');
+        }
+
+        setStatus(message, type = 'ok') {
+            this.statusDiv.textContent = message;
+            this.statusDiv.className = `status ${type}`;
+        }
+
+        /**
+         * Modo simulación: usa una imagen de prueba en lugar de la cámara.
+         * Permite desarrollar sin cámara.
+         */
+        enterSimulationMode() {
+            this.setStatus('⚠️ Cámara no disponible. Usando imagen de prueba.', 'error');
+            // Crear una imagen sintética con texto
+            const simCanvas = document.createElement('canvas');
+            simCanvas.width = 640;
+            simCanvas.height = 480;
+            const ctx = simCanvas.getContext('2d');
+            ctx.fillStyle = '#f0f0f0';
+            ctx.fillRect(0, 0, 640, 480);
+            ctx.fillStyle = '#333';
+            ctx.font = 'bold 24px sans-serif';
+            ctx.fillText('Documento simulado', 50, 100);
+            ctx.font = '18px sans-serif';
+            ctx.fillText('Esto es una prueba del escáner.', 50, 150);
+            ctx.fillText('Ajusta la sensibilidad y captura.', 50, 180);
+            // Dibujar algo que simule una firma
+            ctx.strokeStyle = '#000';
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            ctx.moveTo(400, 300);
+            ctx.bezierCurveTo(450, 280, 350, 250, 500, 200);
+            ctx.stroke();
+
+            // Almacenar como frame simulado
+            this.lastFrameImageData = ctx.getImageData(0, 0, 640, 480);
+            // Dibujar en el canvas de previsualización procesado
+            const processed = ImageProcessor.process(this.lastFrameImageData, this.currentThreshold);
+            this.previewCanvas.width = 640;
+            this.previewCanvas.height = 480;
+            this.previewCtx.putImageData(processed, 0, 0);
+            this.captureBtn.disabled = false;
+        }
+    }
+
+    // Arranque
+    const app = new UIController();
+    app.init();
+
+    // Service Worker para PWA offline
+    if ('serviceWorker' in navigator) {
+        navigator.serviceWorker.register('sw.js')
+            .catch(() => console.log('Service Worker no se pudo registrar.'));
+    }
     </script>
 </body>
 </html>
