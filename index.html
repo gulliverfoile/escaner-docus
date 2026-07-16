@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Escáner MVP con Diagnóstico</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        body { font-family: sans-serif; margin: 10px; }
+        #video { width: 100%; max-width: 640px; display: block; background: #eee; }
+        canvas { display: none; }
+        .controls { margin: 10px 0; }
+        #status { padding: 10px; background: #f8f8f8; border: 1px solid #ccc; margin-bottom: 10px; }
+        .error { color: red; }
+        .ok { color: green; }
+    </style>
+</head>
+<body>
+    <div id="status">Comprobando acceso a cámara...</div>
+    <video id="video" autoplay playsinline></video>
+    <div class="controls">
+        <button id="captureBtn" disabled>Capturar y Procesar</button>
+    </div>
+    <canvas id="outputCanvas"></canvas>
+    <img id="result" style="max-width: 640px; display: block; margin-top: 10px;" />
+    <a id="downloadLink" style="display:none">Descargar PNG</a>
+
+    <script>
+        const statusDiv = document.getElementById('status');
+        const video = document.getElementById('video');
+        const captureBtn = document.getElementById('captureBtn');
+        const outputCanvas = document.getElementById('outputCanvas');
+        const resultImg = document.getElementById('result');
+        const downloadLink = document.getElementById('downloadLink');
+
+        function updateStatus(msg, isError = false) {
+            statusDiv.innerHTML = msg;
+            statusDiv.className = isError ? 'error' : 'ok';
+        }
+
+        // Verificar si el contexto es seguro (HTTPS o localhost)
+        if (window.location.protocol === 'https:' || window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') {
+            updateStatus('Contexto seguro ✅. Solicitando cámara...');
+        } else {
+            updateStatus('⚠️ Contexto NO seguro (HTTP). La cámara solo funciona en HTTPS o localhost. Abre con un servidor HTTPS (ver instrucciones).', true);
+            // Ocultamos el video para no confundir
+            video.style.display = 'none';
+        }
+
+        async function startCamera() {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    video: { 
+                        facingMode: "environment", 
+                        width: { ideal: 1280 }, 
+                        height: { ideal: 720 } 
+                    }
+                });
+                video.srcObject = stream;
+                video.play();
+                captureBtn.disabled = false;
+                updateStatus('Cámara activa 📸. Coloca el documento y pulsa Capturar.');
+            } catch (err) {
+                captureBtn.disabled = true;
+                let errorMsg = '';
+                if (err.name === 'NotAllowedError') {
+                    errorMsg = '❌ Permiso denegado. Debes permitir el acceso a la cámara en los ajustes del navegador.';
+                } else if (err.name === 'NotFoundError') {
+                    errorMsg = '❌ No se encontró ninguna cámara. ¿Tiene cámara este dispositivo?';
+                } else if (err.name === 'NotReadableError') {
+                    errorMsg = '❌ La cámara está siendo usada por otra aplicación.';
+                } else {
+                    errorMsg = '❌ Error inesperado: ' + err.message;
+                }
+                updateStatus(errorMsg, true);
+            }
+        }
+
+        // Procesamiento (igual que antes)
+        function processImage(videoElement) {
+            const tempCanvas = document.createElement('canvas');
+            tempCanvas.width = videoElement.videoWidth;
+            tempCanvas.height = videoElement.videoHeight;
+            const tempCtx = tempCanvas.getContext('2d');
+            tempCtx.drawImage(videoElement, 0, 0);
+            const imageData = tempCtx.getImageData(0, 0, tempCanvas.width, tempCanvas.height);
+            const data = imageData.data;
+            const gray = new Uint8Array(imageData.width * imageData.height);
+            for (let i = 0; i < data.length; i += 4) {
+                gray[i/4] = Math.round(0.299*data[i] + 0.587*data[i+1] + 0.114*data[i+2]);
+            }
+            const width = imageData.width, height = imageData.height;
+            const blockSize = 15, C = -2;
+            const half = Math.floor(blockSize/2);
+            const integral = new Int32Array(width * height);
+            for (let y = 0; y < height; y++) {
+                let sum = 0;
+                for (let x = 0; x < width; x++) {
+                    sum += gray[y*width + x];
+                    if (y === 0) integral[y*width + x] = sum;
+                    else integral[y*width + x] = integral[(y-1)*width + x] + sum;
+                }
+            }
+            for (let y = 0; y < height; y++) {
+                for (let x = 0; x < width; x++) {
+                    const x1 = Math.max(x - half, 0), y1 = Math.max(y - half, 0);
+                    const x2 = Math.min(x + half, width-1), y2 = Math.min(y + half, height-1);
+                    let sum = integral[y2*width + x2];
+                    if (y1 > 0) sum -= integral[(y1-1)*width + x2];
+                    if (x1 > 0) sum -= integral[y2*width + (x1-1)];
+                    if (y1 > 0 && x1 > 0) sum += integral[(y1-1)*width + (x1-1)];
+                    const area = (x2 - x1 + 1) * (y2 - y1 + 1);
+                    const mean = sum / area;
+                    const threshold = mean + C;
+                    const idx = (y*width + x) * 4;
+                    const val = gray[y*width + x] > threshold ? 255 : 0;
+                    data[idx] = val;
+                    data[idx+1] = val;
+                    data[idx+2] = val;
+                }
+            }
+            outputCanvas.width = width;
+            outputCanvas.height = height;
+            const outCtx = outputCanvas.getContext('2d');
+            outCtx.putImageData(imageData, 0, 0);
+            const dataURL = outputCanvas.toDataURL('image/png');
+            resultImg.src = dataURL;
+            downloadLink.href = dataURL;
+            downloadLink.download = 'documento.png';
+            downloadLink.style.display = 'inline';
+        }
+
+        captureBtn.addEventListener('click', () => {
+            processImage(video);
+        });
+
+        // Solo intentar iniciar la cámara si el contexto es seguro
+        if (window.location.protocol === 'https:' || window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') {
+            startCamera();
+        }
+    </script>
+</body>
+</html>
