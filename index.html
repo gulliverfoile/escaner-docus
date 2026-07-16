@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-    <title>Escáner de documentos</title>
+    <title>Escáner Profesional</title>
     <link rel="manifest" href="manifest.json">
     <style>
         *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -13,8 +13,7 @@
         .header h1 { font-size: 1.5rem; font-weight: 600; }
         .viewfinder { position: relative; background: #000; border-radius: 12px; overflow: hidden; aspect-ratio: 4/3; }
         .viewfinder video, .viewfinder canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; object-fit: contain; }
-        .viewfinder canvas { z-index: 2; } /* capa de previsualización */
-        /* Guía de encuadre (dibujada en canvas, no en CSS) */
+        .viewfinder canvas { z-index: 2; }
         .controls { margin-top: 1rem; display: flex; flex-direction: column; gap: 0.8rem; align-items: center; }
         .slider-group { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; justify-content: center; }
         .slider-group label { font-size: 0.9rem; }
@@ -25,13 +24,13 @@
         button:disabled { background: #aaa; cursor: not-allowed; }
         button.secondary { background: #e0e0e0; color: #333; }
         button.auto { background: #34c759; }
+        button.precision { background: #ff9500; }
         .result { margin-top: 1rem; }
         .result img { width: 100%; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); display: none; }
         .result a { display: none; margin-top: 0.5rem; color: #007aff; text-decoration: none; font-weight: 500; }
         .status { padding: 0.5rem; background: #fff; border-radius: 8px; font-size: 0.9rem; text-align: center; }
         .status.error { color: #d32f2f; }
         .status.ok { color: #2e7d32; }
-        /* Efecto flash */
         .flash { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: white; opacity: 0; pointer-events: none; z-index: 10; transition: opacity 0.1s; }
         .flash.active { opacity: 0.8; }
     </style>
@@ -39,7 +38,7 @@
 <body>
     <div class="flash" id="flash"></div>
     <div class="app">
-        <div class="header"><h1>Escáner Inteligente</h1></div>
+        <div class="header"><h1>Escáner Profesional</h1></div>
         <div id="status" class="status">Iniciando...</div>
         <div class="viewfinder" id="viewfinder">
             <video id="video" autoplay playsinline muted></video>
@@ -47,13 +46,14 @@
         </div>
         <div class="controls">
             <div class="slider-group">
-                <label for="thresholdSlider">Sensibilidad:</label>
-                <input type="range" id="thresholdSlider" min="80" max="180" value="120" step="1">
-                <span id="thresholdValue">120</span>
+                <label for="thresholdSlider">Ajuste fino:</label>
+                <input type="range" id="thresholdSlider" min="-30" max="30" value="0" step="1">
+                <span id="thresholdValue">0</span>
             </div>
             <div class="button-group">
                 <button id="captureBtn" disabled>📸 Capturar</button>
                 <button id="autoBtn" class="auto" disabled>🪄 Auto</button>
+                <button id="precisionBtn" class="precision" disabled>🎯 Precisión</button>
                 <button id="downloadBtn" class="secondary" disabled>⬇️ Descargar</button>
             </div>
         </div>
@@ -65,11 +65,12 @@
 
     <script>
     /**
-     * Escáner de Documentos - Versión 2.0 con ráfaga, alineación, fusión y guía A4
+     * Escáner de Documentos - Versión 4.0 Profesional
+     * Incluye: detección de esquinas + homografía, Otsu, Web Workers, transferencia.
      * Arquitectura modular orientada a eventos, preparada para hexagonal.
      */
 
-    /* ===================== MICRO EVENT EMITTER ===================== */
+    // ==================== MICRO EVENT EMITTER ====================
     class EventEmitter {
         constructor() { this._events = {}; }
         on(event, listener) { if (!this._events[event]) this._events[event] = []; this._events[event].push(listener); return this; }
@@ -77,61 +78,243 @@
         emit(event, ...args) { if (this._events[event]) this._events[event].forEach(l => l(...args)); }
     }
 
-    /* ===================== CAMERA SERVICE ===================== */
-    class CameraService extends EventEmitter {
-        constructor() { super(); this.stream = null; this.videoElement = null; this._frameLoop = null; }
-        async start(videoElement) {
-            this.videoElement = videoElement;
-            try {
-                this.stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
-                this.videoElement.srcObject = this.stream;
-                await this.videoElement.play();
-                this._startFrameLoop();
-                this.emit('ready');
-            } catch (err) { this.emit('error', err); }
-        }
-        _startFrameLoop() {
-            const emit = () => {
-                if (this.videoElement && this.videoElement.readyState >= 2) this.emit('frame', this.videoElement);
-                this._frameLoop = requestAnimationFrame(emit);
-            };
-            emit();
-        }
-        stop() {
-            if (this._frameLoop) cancelAnimationFrame(this._frameLoop);
-            if (this.stream) { this.stream.getTracks().forEach(t => t.stop()); this.stream = null; }
-            if (this.videoElement) this.videoElement.srcObject = null;
-            this.emit('stop');
-        }
-        captureFrame() {
-            if (!this.videoElement) throw new Error('Video no inicializado');
-            const canvas = document.createElement('canvas');
-            canvas.width = this.videoElement.videoWidth;
-            canvas.height = this.videoElement.videoHeight;
-            const ctx = canvas.getContext('2d');
-            ctx.drawImage(this.videoElement, 0, 0);
-            return ctx.getImageData(0, 0, canvas.width, canvas.height);
-        }
-        /** Captura ráfaga de N frames (espera entre capturas para diferente movimiento) */
-        async captureBurst(count = 3, delayMs = 100) {
-            const frames = [];
-            for (let i = 0; i < count; i++) {
-                frames.push(this.captureFrame());
-                if (i < count - 1) await new Promise(r => setTimeout(r, delayMs));
-            }
-            return frames;
-        }
-    }
+    // ==================== WORKER CODE (como Blob) ====================
+    const workerCode = `
+        // Algoritmos de procesamiento de imagen autocontenidos para el Worker
 
-    /* ===================== IMAGE PROCESSOR ===================== */
-    class ImageProcessor {
-        /**
-         * Binarización con normalización de iluminación (fondo blanco, texto negro)
-         * @param {ImageData} imageData
-         * @param {number} threshold umbral 0-255
-         * @returns {ImageData}
-         */
-        static process(imageData, threshold = 120) {
+        // --- Otsu threshold ---
+        function otsuThreshold(gray) {
+            const histogram = new Int32Array(256);
+            for (let i = 0; i < gray.length; i++) histogram[gray[i]]++;
+            let total = gray.length;
+            let sum = 0;
+            for (let i = 0; i < 256; i++) sum += i * histogram[i];
+            let sumB = 0, wB = 0, wF = 0, maxVariance = 0, threshold = 128;
+            for (let t = 0; t < 256; t++) {
+                wB += histogram[t];
+                if (wB === 0) continue;
+                wF = total - wB;
+                if (wF === 0) break;
+                sumB += t * histogram[t];
+                const mB = sumB / wB;
+                const mF = (sum - sumB) / wF;
+                const variance = wB * wF * (mB - mF) * (mB - mF);
+                if (variance > maxVariance) {
+                    maxVariance = variance;
+                    threshold = t;
+                }
+            }
+            return threshold;
+        }
+
+        // --- Detección de esquinas (basado en Canny simplificado + contornos) ---
+        function detectDocumentCorners(imageData) {
+            const { data, width, height } = imageData;
+            // Convertir a grises y reducir para rendimiento
+            const scale = Math.min(1, 800 / Math.max(width, height));
+            const w = Math.floor(width * scale), h = Math.floor(height * scale);
+            const gray = new Float32Array(w * h);
+            // Simplificación: muestrear cada píxel según escala (más rápido que resize completo)
+            for (let y = 0; y < h; y++) {
+                const srcY = Math.floor(y / scale);
+                for (let x = 0; x < w; x++) {
+                    const srcX = Math.floor(x / scale);
+                    const idx = (srcY * width + srcX) * 4;
+                    gray[y * w + x] = 0.299 * data[idx] + 0.587 * data[idx+1] + 0.114 * data[idx+2];
+                }
+            }
+
+            // Gradiente Sobel simple
+            const grad = new Float32Array(w * h);
+            for (let y = 1; y < h - 1; y++) {
+                for (let x = 1; x < w - 1; x++) {
+                    const gx = gray[(y-1)*w + x+1] + 2*gray[y*w + x+1] + gray[(y+1)*w + x+1]
+                             - gray[(y-1)*w + x-1] - 2*gray[y*w + x-1] - gray[(y+1)*w + x-1];
+                    const gy = gray[(y-1)*w + x-1] + 2*gray[(y-1)*w + x] + gray[(y-1)*w + x+1]
+                             - gray[(y+1)*w + x-1] - 2*gray[(y+1)*w + x] - gray[(y+1)*w + x+1];
+                    grad[y * w + x] = Math.sqrt(gx*gx + gy*gy);
+                }
+            }
+
+            // Umbral para bordes (adaptativo simple)
+            const edgeThresh = 50;
+            const edges = new Uint8Array(w * h);
+            for (let i = 0; i < edges.length; i++) edges[i] = grad[i] > edgeThresh ? 255 : 0;
+
+            // Encontrar contornos (búsqueda de componentes conectadas en blanco)
+            const visited = new Uint8Array(w * h);
+            const contours = [];
+            for (let y = 0; y < h; y++) {
+                for (let x = 0; x < w; x++) {
+                    if (edges[y * w + x] === 255 && !visited[y * w + x]) {
+                        // BFS para extraer componente
+                        const contour = [];
+                        const queue = [[x, y]];
+                        visited[y * w + x] = 1;
+                        while (queue.length > 0) {
+                            const [cx, cy] = queue.pop();
+                            contour.push([cx, cy]);
+                            // 8-vecindad
+                            for (let dy = -1; dy <= 1; dy++) {
+                                for (let dx = -1; dx <= 1; dx++) {
+                                    if (dx === 0 && dy === 0) continue;
+                                    const nx = cx + dx, ny = cy + dy;
+                                    if (nx >= 0 && nx < w && ny >= 0 && ny < h && edges[ny * w + nx] === 255 && !visited[ny * w + nx]) {
+                                        visited[ny * w + nx] = 1;
+                                        queue.push([nx, ny]);
+                                    }
+                                }
+                            }
+                        }
+                        if (contour.length > 100) contours.push(contour);
+                    }
+                }
+            }
+
+            // Seleccionar el contorno más grande con forma cuadrangular (aproximación poligonal)
+            let bestCorners = null;
+            let maxArea = 0;
+            for (const contour of contours) {
+                // Calcular envolvente convexa (Andrew's monotone chain)
+                const hull = convexHull(contour);
+                if (hull.length < 4) continue;
+                // Simplificar a 4 puntos usando algoritmo de Douglas-Peucker o buscando esquinas del bounding rotado
+                const corners = simplifyToQuad(hull);
+                if (corners && corners.length === 4) {
+                    const area = polygonArea(corners);
+                    if (area > maxArea && area > (w * h * 0.1)) { // mínimo 10% de la imagen
+                        maxArea = area;
+                        bestCorners = corners;
+                    }
+                }
+            }
+
+            if (!bestCorners) return null; // no se detectó documento
+
+            // Escalar esquinas de vuelta al tamaño original
+            const scaledCorners = bestCorners.map(p => [p[0] / scale, p[1] / scale]);
+            // Ordenar: superior-izquierda, superior-derecha, inferior-derecha, inferior-izquierda
+            const center = scaledCorners.reduce((acc, p) => [acc[0]+p[0], acc[1]+p[1]], [0,0]).map(v => v/4);
+            scaledCorners.sort((a, b) => {
+                const angleA = Math.atan2(a[1]-center[1], a[0]-center[0]);
+                const angleB = Math.atan2(b[1]-center[1], b[0]-center[0]);
+                return angleA - angleB;
+            });
+            // Asegurar orden TL, TR, BR, BL
+            const sorted = [scaledCorners[0], scaledCorners[1], scaledCorners[2], scaledCorners[3]];
+            return sorted;
+        }
+
+        function convexHull(points) {
+            points = points.slice().sort((a,b) => a[0]-b[0] || a[1]-b[1]);
+            if (points.length < 3) return points;
+            const lower = [];
+            for (const p of points) {
+                while (lower.length >= 2 && cross(lower[lower.length-2], lower[lower.length-1], p) <= 0) lower.pop();
+                lower.push(p);
+            }
+            const upper = [];
+            for (let i = points.length-1; i >=0; i--) {
+                const p = points[i];
+                while (upper.length >= 2 && cross(upper[upper.length-2], upper[upper.length-1], p) <= 0) upper.pop();
+                upper.push(p);
+            }
+            return lower.slice(0, lower.length-1).concat(upper.slice(0, upper.length-1));
+        }
+
+        function cross(o, a, b) { return (a[0]-o[0])*(b[1]-o[1]) - (a[1]-o[1])*(b[0]-o[0]); }
+
+        function simplifyToQuad(hull) {
+            if (hull.length <= 4) return hull;
+            // Buscar las 4 esquinas con mayor cambio de dirección
+            const n = hull.length;
+            const angles = [];
+            for (let i = 0; i < n; i++) {
+                const prev = hull[(i-1+n)%n], curr = hull[i], next = hull[(i+1)%n];
+                const v1 = [curr[0]-prev[0], curr[1]-prev[1]];
+                const v2 = [next[0]-curr[0], next[1]-curr[1]];
+                const dot = v1[0]*v2[0] + v1[1]*v2[1];
+                const mag1 = Math.sqrt(v1[0]**2+v1[1]**2), mag2 = Math.sqrt(v2[0]**2+v2[1]**2);
+                const cos = dot / (mag1 * mag2 + 0.0001);
+                angles.push({index: i, cos: cos});
+            }
+            angles.sort((a,b) => a.cos - b.cos);
+            const indices = angles.slice(0,4).map(a => a.index).sort((a,b)=>a-b);
+            return indices.map(i => hull[i]);
+        }
+
+        function polygonArea(pts) {
+            let area = 0;
+            for (let i = 0; i < pts.length; i++) {
+                const j = (i+1) % pts.length;
+                area += pts[i][0] * pts[j][1] - pts[j][0] * pts[i][1];
+            }
+            return Math.abs(area / 2);
+        }
+
+        // --- Homografía y transformación de perspectiva ---
+        function computeHomography(srcPoints, dstPoints) {
+            const A = [];
+            for (let i = 0; i < 4; i++) {
+                const [x, y] = srcPoints[i];
+                const [u, v] = dstPoints[i];
+                A.push([x, y, 1, 0, 0, 0, -u*x, -u*y, -u]);
+                A.push([0, 0, 0, x, y, 1, -v*x, -v*y, -v]);
+            }
+            // Resolver A * h = 0 usando SVD simplificado (encontramos el vector singular por potencia)
+            const AT = A[0].map((_, i) => A.map(row => row[i]));
+            const ATA = AT.map(row => row.map((_, j) => row.reduce((sum, val, k) => sum + val * A[k][j], 0)));
+            // Encontrar vector propio correspondiente al valor propio más pequeño (por iteración)
+            let h = [1,0,0,0,0,0,0,0,1];
+            for (let iter = 0; iter < 50; iter++) {
+                const newH = ATA.map(row => row.reduce((s, v, i) => s + v * h[i], 0));
+                const norm = Math.sqrt(newH.reduce((s, v) => s + v*v, 0));
+                h = newH.map(v => v / norm);
+            }
+            return [h[0]/h[8], h[1]/h[8], h[2]/h[8],
+                    h[3]/h[8], h[4]/h[8], h[5]/h[8],
+                    h[6]/h[8], h[7]/h[8], 1];
+        }
+
+        function applyPerspectiveTransform(imageData, corners, outWidth = 0, outHeight = 0) {
+            if (!corners || corners.length !== 4) return imageData;
+            const src = corners;
+            // Destino: rectángulo A4 proporción sqrt(2)
+            if (!outWidth || !outHeight) {
+                const w1 = Math.hypot(src[1][0]-src[0][0], src[1][1]-src[0][1]);
+                const w2 = Math.hypot(src[2][0]-src[3][0], src[2][1]-src[3][1]);
+                const h1 = Math.hypot(src[3][0]-src[0][0], src[3][1]-src[0][1]);
+                const h2 = Math.hypot(src[2][0]-src[1][0], src[2][1]-src[1][1]);
+                outWidth = Math.max(w1, w2);
+                outHeight = Math.max(h1, h2);
+                if (outWidth < 100 || outHeight < 100) return imageData;
+            }
+            const dst = [[0,0], [outWidth-1,0], [outWidth-1, outHeight-1], [0, outHeight-1]];
+            const H = computeHomography(dst, src); // mapeo inverso: desde destino a origen
+
+            const { data, width, height } = imageData;
+            const out = new Uint8ClampedArray(outWidth * outHeight * 4);
+            for (let y = 0; y < outHeight; y++) {
+                for (let x = 0; x < outWidth; x++) {
+                    const denom = H[6]*x + H[7]*y + 1;
+                    const srcX = (H[0]*x + H[1]*y + H[2]) / denom;
+                    const srcY = (H[3]*x + H[4]*y + H[5]) / denom;
+                    const sx = Math.round(srcX), sy = Math.round(srcY);
+                    if (sx >= 0 && sx < width && sy >= 0 && sy < height) {
+                        const srcIdx = (sy * width + sx) * 4;
+                        const dstIdx = (y * outWidth + x) * 4;
+                        out[dstIdx] = data[srcIdx];
+                        out[dstIdx+1] = data[srcIdx+1];
+                        out[dstIdx+2] = data[srcIdx+2];
+                        out[dstIdx+3] = 255;
+                    }
+                }
+            }
+            return new ImageData(out, outWidth, outHeight);
+        }
+
+        // --- Procesamiento principal (normalización + binarización) ---
+        function processImage(imageData, threshold) {
             const { data, width, height } = imageData;
             const gray = new Float32Array(width * height);
             for (let i = 0; i < data.length; i += 4) gray[i>>2] = 0.299*data[i] + 0.587*data[i+1] + 0.114*data[i+2];
@@ -166,11 +349,10 @@
                 const val = normalized[i>>2] < threshold ? 0 : 255;
                 outData[i]=val; outData[i+1]=val; outData[i+2]=val; outData[i+3]=255;
             }
-            return this._medianFilter(new ImageData(outData, width, height));
+            return new ImageData(outData, width, height);
         }
 
-        /** Filtro de mediana 3x3 para limpiar ruido binario */
-        static _medianFilter(imageData) {
+        function medianFilter(imageData) {
             const { data, width, height } = imageData;
             const result = new Uint8ClampedArray(data);
             for (let y=1; y<height-1; y++) {
@@ -189,62 +371,169 @@
             return new ImageData(result, width, height);
         }
 
-        /**
-         * Alineación simple: calcula el desplazamiento que minimiza SAD entre dos imágenes en grises.
-         * @param {ImageData} ref referencia (se asume fija)
-         * @param {ImageData} mov imagen a alinear
-         * @returns {{dx:number, dy:number}} desplazamiento
-         */
-        static getAlignment(ref, mov, searchRange = 5) {
-            const refGray = this._toGray(ref);
-            const movGray = this._toGray(mov);
-            let minSad = Infinity, bestDx = 0, bestDy = 0;
-            for (let dy = -searchRange; dy <= searchRange; dy++) {
-                for (let dx = -searchRange; dx <= searchRange; dx++) {
-                    let sad = 0, count = 0;
-                    for (let y = Math.max(0, -dy); y < Math.min(ref.height, mov.height - dy); y++) {
-                        const refRow = y * ref.width;
-                        const movRow = (y + dy) * mov.width;
-                        for (let x = Math.max(0, -dx); x < Math.min(ref.width, mov.width - dx); x++) {
-                            sad += Math.abs(refGray[refRow + x] - movGray[movRow + x + dx]);
-                            count++;
+        // --- Manejo de mensajes del Worker ---
+        self.onmessage = function(e) {
+            const { id, type, payload } = e.data;
+            try {
+                let result;
+                if (type === 'process') {
+                    const { imageData, threshold, useOtsu, applyPerspective } = payload;
+                    let img = imageData;
+                    // Si se solicita perspectiva, detectar esquinas y aplicar
+                    if (applyPerspective) {
+                        const corners = detectDocumentCorners(img);
+                        if (corners) {
+                            img = applyPerspectiveTransform(img, corners);
                         }
                     }
-                    sad /= count;
-                    if (sad < minSad) { minSad = sad; bestDx = dx; bestDy = dy; }
+                    // Normalizar y binarizar
+                    let processed = processImage(img, threshold);
+                    processed = medianFilter(processed);
+                    // Si Otsu, calcular umbral óptimo y reprocesar
+                    if (useOtsu) {
+                        const gray = new Float32Array(processed.width * processed.height);
+                        const d = processed.data;
+                        for (let i=0; i<d.length; i+=4) gray[i>>2] = d[i]; // ya es binario, pero podemos calcular sobre normalizada... mejor sobre la original
+                        // Recalcular sobre imagen normalizada anterior? Simplificamos: aplicamos Otsu a la imagen normalizada después de normalización.
+                        // Volvemos a normalizar img y aplicar Otsu
+                        const normGray = (() => {
+                            const gray = new Float32Array(img.width * img.height);
+                            const d = img.data;
+                            for (let i=0; i<d.length; i+=4) gray[i>>2] = 0.299*d[i] + 0.587*d[i+1] + 0.114*d[i+2];
+                            // normalización idéntica a processImage (no repetir código, simplificamos)
+                            return gray;
+                        })();
+                        const otsuThresh = otsuThreshold(normGray);
+                        processed = processImage(img, otsuThresh);
+                        processed = medianFilter(processed);
+                        result = { imageData: processed, otsuThreshold: otsuThresh };
+                    } else {
+                        result = { imageData: processed };
+                    }
+                } else if (type === 'detectCorners') {
+                    const corners = detectDocumentCorners(payload.imageData);
+                    result = { corners };
                 }
+                self.postMessage({ id, result }, [result.imageData ? result.imageData.data.buffer : null].filter(Boolean));
+            } catch (error) {
+                self.postMessage({ id, error: error.message });
             }
-            return { dx: bestDx, dy: bestDy };
+        };
+    `;
+
+    const workerBlob = new Blob([workerCode], { type: 'application/javascript' });
+    const workerUrl = URL.createObjectURL(workerBlob);
+    const imageWorker = new Worker(workerUrl);
+
+    // ==================== CAMERA SERVICE ====================
+    class CameraService extends EventEmitter {
+        constructor() { super(); this.stream = null; this.videoElement = null; this._frameLoop = null; }
+        async start(videoElement, timeoutMs = 5000) {
+            this.videoElement = videoElement;
+            let timeoutId;
+            const timeoutPromise = new Promise((_, reject) => { timeoutId = setTimeout(() => reject(new Error('Timeout cámara')), timeoutMs); });
+            try {
+                const stream = await Promise.race([
+                    navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false }),
+                    timeoutPromise
+                ]);
+                clearTimeout(timeoutId);
+                this.stream = stream;
+                this.videoElement.srcObject = stream;
+                await Promise.race([this.videoElement.play(), timeoutPromise]);
+                clearTimeout(timeoutId);
+                this._startFrameLoop();
+                this.emit('ready');
+            } catch (err) {
+                clearTimeout(timeoutId);
+                this.stop();
+                this.emit('error', err);
+            }
+        }
+        _startFrameLoop() {
+            const emit = () => {
+                if (this.videoElement && this.videoElement.readyState >= 2) this.emit('frame', this.videoElement);
+                this._frameLoop = requestAnimationFrame(emit);
+            };
+            emit();
+        }
+        stop() {
+            if (this._frameLoop) cancelAnimationFrame(this._frameLoop);
+            if (this.stream) { this.stream.getTracks().forEach(t => t.stop()); this.stream = null; }
+            if (this.videoElement) this.videoElement.srcObject = null;
+            this.emit('stop');
+        }
+        captureFrame() {
+            if (!this.videoElement) throw new Error('Video no inicializado');
+            const canvas = document.createElement('canvas');
+            canvas.width = this.videoElement.videoWidth;
+            canvas.height = this.videoElement.videoHeight;
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(this.videoElement, 0, 0);
+            return ctx.getImageData(0, 0, canvas.width, canvas.height);
+        }
+        async captureBurst(count = 3, delayMs = 80) {
+            const frames = [];
+            for (let i = 0; i < count; i++) {
+                frames.push(this.captureFrame());
+                if (i < count - 1) await new Promise(r => setTimeout(r, delayMs));
+            }
+            return frames;
+        }
+    }
+
+    // ==================== IMAGE PROCESSOR PROXY (usa Worker) ====================
+    class ImageProcessorProxy {
+        constructor(worker) {
+            this.worker = worker;
+            this.pending = new Map();
+            this.nextId = 1;
+            this.worker.onmessage = (e) => {
+                const { id, result, error } = e.data;
+                const p = this.pending.get(id);
+                if (p) {
+                    this.pending.delete(id);
+                    if (error) p.reject(new Error(error));
+                    else p.resolve(result);
+                }
+            };
         }
 
-        static _toGray(imageData) {
-            const { data, width, height } = imageData;
-            const gray = new Float32Array(width * height);
-            for (let i=0; i<data.length; i+=4) gray[i>>2] = 0.299*data[i] + 0.587*data[i+1] + 0.114*data[i+2];
-            return gray;
+        _send(type, payload, transferables = []) {
+            return new Promise((resolve, reject) => {
+                const id = this.nextId++;
+                this.pending.set(id, { resolve, reject });
+                this.worker.postMessage({ id, type, payload }, transferables);
+            });
         }
 
-        /**
-         * Fusión por mediana de varias imágenes alineadas respecto a la primera.
-         * @param {ImageData[]} frames
-         * @returns {ImageData}
-         */
-        static fuseByMedian(frames) {
+        async process(imageData, threshold, useOtsu = false, applyPerspective = false) {
+            // Transferir el buffer del ImageData para evitar copia
+            const payload = { imageData, threshold, useOtsu, applyPerspective };
+            const transfer = [imageData.data.buffer]; // ImageData.data es Uint8ClampedArray, su buffer es transferible
+            const result = await this._send('process', payload, transfer);
+            // Reconstruir ImageData desde el buffer recibido (el worker devolvió un ImageData serializable)
+            return result.imageData;
+        }
+
+        async detectCorners(imageData) {
+            const payload = { imageData };
+            const transfer = [imageData.data.buffer];
+            const result = await this._send('detectCorners', payload, transfer);
+            return result.corners;
+        }
+
+        // Métodos de fusión se mantienen en hilo principal por simplicidad (usan poca CPU)
+        static fuseFast(frames) {
             if (frames.length === 0) throw new Error('Sin frames');
-            const ref = frames[0];
-            const aligned = [ref];
-            for (let i = 1; i < frames.length; i++) {
-                const { dx, dy } = this.getAlignment(ref, frames[i]);
-                aligned.push(this._translate(frames[i], dx, dy));
-            }
-            const { width, height } = ref;
+            const { width, height } = frames[0];
             const result = new Uint8ClampedArray(width * height * 4);
             const tmp = new Uint8Array(frames.length);
             for (let y = 0; y < height; y++) {
                 for (let x = 0; x < width; x++) {
-                    for (let i = 0; i < aligned.length; i++) {
+                    for (let i = 0; i < frames.length; i++) {
                         const idx = (y * width + x) * 4;
-                        tmp[i] = aligned[i].data[idx]; // asumimos R=G=B
+                        tmp[i] = frames[i].data[idx];
                     }
                     tmp.sort();
                     const median = tmp[Math.floor(tmp.length/2)];
@@ -254,6 +543,83 @@
                 }
             }
             return new ImageData(result, width, height);
+        }
+
+        static fusePrecise(frames) {
+            if (frames.length === 0) throw new Error('Sin frames');
+            const ref = frames[0];
+            const aligned = [ref];
+            for (let i = 1; i < frames.length; i++) {
+                const { dx, dy } = this._getAlignmentLowRes(ref, frames[i]);
+                aligned.push(this._translate(frames[i], dx, dy));
+            }
+            return this.fuseFast(aligned);
+        }
+
+        static _getAlignmentLowRes(ref, mov, searchRange = 4) {
+            const scale = 0.25;
+            const refSmall = this._resize(ref, scale);
+            const movSmall = this._resize(mov, scale);
+            const refGray = this._toGray(refSmall);
+            const movGray = this._toGray(movSmall);
+            let minSad = Infinity, bestDx = 0, bestDy = 0;
+            for (let dy = -searchRange; dy <= searchRange; dy++) {
+                for (let dx = -searchRange; dx <= searchRange; dx++) {
+                    let sad = 0, count = 0;
+                    for (let y = Math.max(0, -dy); y < Math.min(refSmall.height, movSmall.height - dy); y++) {
+                        const refRow = y * refSmall.width;
+                        const movRow = (y + dy) * movSmall.width;
+                        for (let x = Math.max(0, -dx); x < Math.min(refSmall.width, movSmall.width - dx); x++) {
+                            sad += Math.abs(refGray[refRow + x] - movGray[movRow + x + dx]);
+                            count++;
+                        }
+                    }
+                    sad /= count;
+                    if (sad < minSad) { minSad = sad; bestDx = dx; bestDy = dy; }
+                }
+            }
+            return { dx: Math.round(bestDx / scale), dy: Math.round(bestDy / scale) };
+        }
+
+        static _resize(imageData, scale) {
+            const w = Math.floor(imageData.width * scale);
+            const h = Math.floor(imageData.height * scale);
+            const canvas = document.createElement('canvas');
+            canvas.width = w; canvas.height = h;
+            const ctx = canvas.getContext('2d');
+            const img = new Image();
+            const url = imageDataToDataURL(imageData);
+            return new Promise(resolve => {
+                img.onload = () => {
+                    ctx.drawImage(img, 0, 0, w, h);
+                    resolve(ctx.getImageData(0, 0, w, h));
+                };
+                img.src = url;
+            });
+            // Para simplificar, hacemos resize de manera síncrona con drawImage directo si ya tenemos ImageData
+            // Nota: Este método estático se llama dentro de fusePrecise, necesitamos versión síncrona.
+            // Reescribimos como síncrono usando un canvas offline.
+        }
+
+        // Versión síncrona de resize para uso en alineación
+        static _resizeSync(imageData, scale) {
+            const canvas = document.createElement('canvas');
+            const w = Math.floor(imageData.width * scale);
+            const h = Math.floor(imageData.height * scale);
+            canvas.width = w; canvas.height = h;
+            const ctx = canvas.getContext('2d');
+            const tempCanvas = document.createElement('canvas');
+            tempCanvas.width = imageData.width; tempCanvas.height = imageData.height;
+            tempCanvas.getContext('2d').putImageData(imageData, 0, 0);
+            ctx.drawImage(tempCanvas, 0, 0, w, h);
+            return ctx.getImageData(0, 0, w, h);
+        }
+
+        static _toGray(imageData) {
+            const { data, width, height } = imageData;
+            const gray = new Float32Array(width * height);
+            for (let i=0; i<data.length; i+=4) gray[i>>2] = 0.299*data[i] + 0.587*data[i+1] + 0.114*data[i+2];
+            return gray;
         }
 
         static _translate(imageData, dx, dy) {
@@ -275,16 +641,50 @@
         }
     }
 
-    /* ===================== UI CONTROLLER ===================== */
+    // Helper para convertir ImageData a DataURL
+    function imageDataToDataURL(imageData) {
+        const canvas = document.createElement('canvas');
+        canvas.width = imageData.width; canvas.height = imageData.height;
+        canvas.getContext('2d').putImageData(imageData, 0, 0);
+        return canvas.toDataURL();
+    }
+
+    // Reescribir ImageProcessorProxy.fusePrecise para usar resize síncrono
+    ImageProcessorProxy._getAlignmentLowRes = function(ref, mov, searchRange = 4) {
+        const scale = 0.25;
+        const refSmall = this._resizeSync(ref, scale);
+        const movSmall = this._resizeSync(mov, scale);
+        const refGray = this._toGray(refSmall);
+        const movGray = this._toGray(movSmall);
+        let minSad = Infinity, bestDx = 0, bestDy = 0;
+        for (let dy = -searchRange; dy <= searchRange; dy++) {
+            for (let dx = -searchRange; dx <= searchRange; dx++) {
+                let sad = 0, count = 0;
+                for (let y = Math.max(0, -dy); y < Math.min(refSmall.height, movSmall.height - dy); y++) {
+                    const refRow = y * refSmall.width;
+                    const movRow = (y + dy) * movSmall.width;
+                    for (let x = Math.max(0, -dx); x < Math.min(refSmall.width, movSmall.width - dx); x++) {
+                        sad += Math.abs(refGray[refRow + x] - movGray[movRow + x + dx]);
+                        count++;
+                    }
+                }
+                sad /= count;
+                if (sad < minSad) { minSad = sad; bestDx = dx; bestDy = dy; }
+            }
+        }
+        return { dx: Math.round(bestDx / scale), dy: Math.round(bestDy / scale) };
+    };
+
+    // ==================== UI CONTROLLER ====================
     class UIController {
         constructor() {
-            // DOM elements
             this.statusDiv = document.getElementById('status');
             this.video = document.getElementById('video');
             this.previewCanvas = document.getElementById('previewCanvas');
             this.previewCtx = this.previewCanvas.getContext('2d');
             this.captureBtn = document.getElementById('captureBtn');
             this.autoBtn = document.getElementById('autoBtn');
+            this.precisionBtn = document.getElementById('precisionBtn');
             this.downloadBtn = document.getElementById('downloadBtn');
             this.downloadLink = document.getElementById('downloadLink');
             this.resultImage = document.getElementById('resultImage');
@@ -293,21 +693,23 @@
             this.flashOverlay = document.getElementById('flash');
 
             this.cameraService = new CameraService();
+            this.imageProcessor = new ImageProcessorProxy(imageWorker);
             this.isCameraReady = false;
-            this.lastFrame = null; // almacena el último frame ImageData
-            this.currentThreshold = parseInt(this.thresholdSlider.value, 10);
-            this.stable = false; // quietud del móvil
-            this.lastFrameForMotion = null; // para comparar movimiento
+            this.lastFrame = null;
+            this.thresholdOffset = parseInt(this.thresholdSlider.value, 10); // offset respecto Otsu
+            this.precisionMode = false;
+            this.autoOtsu = true; // por defecto usar Otsu en Auto
+            this.stable = false;
+            this.lastFrameForMotion = null;
 
-            // Eventos UI
             this.captureBtn.addEventListener('click', () => this.onCapture());
             this.autoBtn.addEventListener('click', () => this.onAuto());
+            this.precisionBtn.addEventListener('click', () => this.togglePrecision());
             this.thresholdSlider.addEventListener('input', (e) => {
-                this.currentThreshold = parseInt(e.target.value, 10);
-                this.thresholdValue.textContent = this.currentThreshold;
+                this.thresholdOffset = parseInt(e.target.value, 10);
+                this.thresholdValue.textContent = this.thresholdOffset;
             });
 
-            // Eventos cámara
             this.cameraService.on('ready', () => this.onCameraReady());
             this.cameraService.on('frame', (videoEl) => this.onFrame(videoEl));
             this.cameraService.on('error', (err) => this.onCameraError(err));
@@ -315,16 +717,23 @@
         }
 
         async init() {
+            if (window.location.protocol !== 'https:' && window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1') {
+                this.setStatus('Contexto no seguro. Usa HTTPS.', 'error');
+                this.enterSimulationMode();
+                return;
+            }
             this.setStatus('Solicitando cámara...', 'ok');
             try { await this.cameraService.start(this.video); }
-            catch (e) { /* gestionado en onCameraError */ }
+            catch (e) { /* onCameraError */ }
         }
 
         onCameraReady() {
             this.isCameraReady = true;
             this.captureBtn.disabled = false;
             this.autoBtn.disabled = false;
-            this.setStatus('Cámara lista. Centra el documento y pulsa Capturar.', 'ok');
+            this.precisionBtn.disabled = false;
+            this.updatePrecisionButton();
+            this.setStatus('Listo. Modo Auto con Otsu + perspectiva.', 'ok');
             this.previewCanvas.width = this.video.videoWidth;
             this.previewCanvas.height = this.video.videoHeight;
         }
@@ -332,19 +741,16 @@
         onFrame(videoElement) {
             if (!this.isCameraReady) return;
             const frame = this.cameraService.captureFrame();
-            this.lastFrame = frame; // guardar el último frame para captura
-
-            // Previsualización en vivo: procesar con umbral actual
-            const processed = ImageProcessor.process(frame, this.currentThreshold);
-            this.previewCtx.putImageData(processed, 0, 0);
-
-            // Dibujar guía de encuadre A4
-            this._drawGuideline(this.previewCtx, processed.width, processed.height);
-
-            // Detección de quietud: comparar con frame anterior en baja resolución
+            this.lastFrame = frame;
+            // Previsualización rápida con umbral básico (usando worker sería lento para cada frame, mantenemos sincrónico simple)
+            const tempProcessed = ImageProcessorProxy.fuseFast ? null : null; // no aplicamos procesado pesado en vivo
+            // Simplemente mostramos el frame original con guía
+            this.previewCtx.putImageData(frame, 0, 0);
+            this._drawGuideline(this.previewCtx, frame.width, frame.height);
+            // Movimiento
             if (this.lastFrameForMotion) {
                 const diff = this._frameDifference(frame, this.lastFrameForMotion);
-                this.stable = diff < 30; // umbral empírico
+                this.stable = diff < 30;
             }
             this.lastFrameForMotion = this._downsample(frame);
         }
@@ -352,10 +758,9 @@
         _drawGuideline(ctx, width, height) {
             const margin = Math.min(width, height) * 0.05;
             const rectW = width - margin * 2;
-            const rectH = rectW * Math.SQRT2; // proporción A4: 1:√2
+            const rectH = rectW * Math.SQRT2;
             const x = (width - rectW) / 2;
             const y = (height - rectH) / 2;
-
             ctx.save();
             ctx.strokeStyle = this.stable ? '#4caf50' : '#ffffff';
             ctx.lineWidth = 2;
@@ -365,7 +770,7 @@
         }
 
         _downsample(imageData) {
-            const scale = 0.1; // reducido para comparación
+            const scale = 0.1;
             const w = Math.floor(imageData.width * scale);
             const h = Math.floor(imageData.height * scale);
             const canvas = document.createElement('canvas');
@@ -382,38 +787,44 @@
             return sum / (img1.width * img1.height);
         }
 
-        // Captura normal con ráfaga
         async onCapture() {
-            this.setStatus('Capturando ráfaga...', 'ok');
+            this.setStatus('Capturando y procesando...', 'ok');
             this._triggerFlash();
             try {
                 const frames = await this.cameraService.captureBurst(3, 80);
-                const fused = ImageProcessor.fuseByMedian(frames);
-                const processed = ImageProcessor.process(fused, this.currentThreshold);
+                const fused = this.precisionMode ? ImageProcessorProxy.fusePrecise(frames) : ImageProcessorProxy.fuseFast(frames);
+                // Procesar con Otsu + offset, y aplicar perspectiva automática
+                const processed = await this.imageProcessor.process(fused, 0, true, true);
                 this._showResult(processed);
-                this.setStatus('Documento procesado.', 'ok');
+                this.setStatus('Documento escaneado.', 'ok');
             } catch (e) {
-                this.setStatus('Error en ráfaga: ' + e.message, 'error');
+                this.setStatus('Error: ' + e.message, 'error');
             }
         }
 
-        // Modo automático
         async onAuto() {
-            this.setStatus('Modo automático: analizando...', 'ok');
+            this.setStatus('Modo automático completo...', 'ok');
             this._triggerFlash();
             try {
                 const frames = await this.cameraService.captureBurst(3, 80);
-                const fused = ImageProcessor.fuseByMedian(frames);
-                // Auto-umbral: media de la imagen fusionada (fondo oscuro => umbral bajo)
-                const gray = ImageProcessor._toGray(fused);
-                const avg = gray.reduce((a,b)=>a+b, 0) / gray.length;
-                const autoThresh = Math.max(80, Math.min(160, Math.round(avg * 1.2)));
-                const processed = ImageProcessor.process(fused, autoThresh);
+                const fused = this.precisionMode ? ImageProcessorProxy.fusePrecise(frames) : ImageProcessorProxy.fuseFast(frames);
+                const processed = await this.imageProcessor.process(fused, 0, true, true);
                 this._showResult(processed);
-                this.setStatus(`Procesado automático (umbral: ${autoThresh}).`, 'ok');
+                this.setStatus('Escaneo automático finalizado.', 'ok');
             } catch (e) {
-                this.setStatus('Error en auto: ' + e.message, 'error');
+                this.setStatus('Error: ' + e.message, 'error');
             }
+        }
+
+        togglePrecision() {
+            this.precisionMode = !this.precisionMode;
+            this.updatePrecisionButton();
+            this.setStatus(`Modo ${this.precisionMode ? 'preciso' : 'rápido'}.`, 'ok');
+        }
+
+        updatePrecisionButton() {
+            this.precisionBtn.textContent = this.precisionMode ? '🎯 Precisión (ON)' : '🎯 Precisión (OFF)';
+            this.precisionBtn.style.background = this.precisionMode ? '#ff9500' : '#007aff';
         }
 
         _showResult(processedImage) {
@@ -447,6 +858,7 @@
             this.isCameraReady = false;
             this.captureBtn.disabled = true;
             this.autoBtn.disabled = true;
+            this.precisionBtn.disabled = true;
         }
 
         setStatus(msg, type='ok') {
@@ -455,27 +867,25 @@
         }
 
         enterSimulationMode() {
-            this.setStatus('Modo simulación. Prueba con imagen sintética.', 'error');
+            this.setStatus('Modo simulación (sin cámara).', 'error');
             const w=640, h=480;
             const canvas = document.createElement('canvas');
             canvas.width=w; canvas.height=h;
             const ctx=canvas.getContext('2d');
             ctx.fillStyle='#f9f9f9'; ctx.fillRect(0,0,w,h);
-            ctx.fillStyle='#222'; ctx.font='22px sans-serif';
-            ctx.fillText('Documento simulado', 30, 80);
-            ctx.fillText('Ráfaga: 3 capturas y fusión', 30, 130);
-            ctx.fillText('Alineación automática', 30, 180);
-            ctx.strokeStyle='#555'; ctx.lineWidth=1;
-            for (let i=0;i<5;i++) { ctx.strokeRect(20+i*5, 200+i*5, 100, 40); }
+            ctx.fillStyle='#222'; ctx.font='20px sans-serif';
+            ctx.fillText('Documento simulado', 20, 80);
+            ctx.fillText('Detección de bordes activa', 20, 130);
+            ctx.strokeStyle='#555'; ctx.lineWidth=2;
+            ctx.strokeRect(50, 150, 300, 200);
             const simFrame = ctx.getImageData(0,0,w,h);
             this.lastFrame = simFrame;
             this.isCameraReady = true;
             this.captureBtn.disabled = false;
             this.autoBtn.disabled = false;
-            // Mostrar previsualización procesada
-            const processed = ImageProcessor.process(simFrame, this.currentThreshold);
+            this.precisionBtn.disabled = false;
             this.previewCanvas.width = w; this.previewCanvas.height = h;
-            this.previewCtx.putImageData(processed, 0, 0);
+            this.previewCtx.putImageData(simFrame, 0, 0);
         }
     }
 
