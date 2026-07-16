@@ -13,8 +13,9 @@
         .dropzone.dragover { border-color: #007aff; background: #e8f0fe; }
         .preview { display: flex; gap: 1rem; flex-wrap: wrap; justify-content: center; margin: 1rem 0; }
         .preview img { max-width: 300px; max-height: 300px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
-        .controls { display: flex; flex-wrap: wrap; gap: 0.5rem; justify-content: center; }
-        button { padding: 0.7rem 1.2rem; border: none; border-radius: 8px; font-size: 1rem; cursor: pointer; background: #007aff; color: white; font-weight: 500; transition: background 0.2s; }
+        .controls { display: flex; flex-wrap: wrap; gap: 0.5rem; justify-content: center; align-items: center; }
+        button, select { padding: 0.7rem 1.2rem; border-radius: 8px; font-size: 1rem; cursor: pointer; border: 1px solid #ccc; background: #fff; }
+        button { background: #007aff; color: white; border: none; font-weight: 500; transition: background 0.2s; }
         button:disabled { background: #aaa; cursor: not-allowed; }
         button.secondary { background: #e0e0e0; color: #333; }
         .progress { margin-top: 1rem; background: #eee; border-radius: 8px; height: 8px; overflow: hidden; display: none; }
@@ -38,10 +39,18 @@
         <div class="preview" id="previewContainer"></div>
         <div class="controls">
             <button id="convertBtn" disabled>📄 Convertir a PDF</button>
-            <select id="modeSelect" style="padding:0.5rem; border-radius:8px; border:1px solid #ccc;">
-                <option value="text">Solo texto</option>
+            <select id="modeSelect" style="padding:0.5rem;">
+                <option value="text">Solo texto visible</option>
                 <option value="full">Texto + Formas</option>
             </select>
+            <select id="fontSelect" style="padding:0.5rem;">
+                <option value="Arial">Arial (sans-serif)</option>
+                <option value="Times">Times (serif)</option>
+                <option value="Courier">Courier (monoespaciado)</option>
+            </select>
+            <label style="display:flex; align-items:center; gap:0.5rem;">
+                <input type="checkbox" id="bgCheckbox" checked> Fondo original
+            </label>
         </div>
         <div class="progress" id="progress"><div class="progress-bar" id="progressBar"></div></div>
         <div class="result" id="resultContainer"></div>
@@ -49,9 +58,8 @@
 
     <script>
     /**
-     * Conversor de Imagen a Documento (PDF con texto y formas)
-     * Arquitectura modular, eventos, preparado para hexagonal.
-     * Dependencias externas: Tesseract.js, jsPDF (cargadas bajo demanda)
+     * Conversor de Imagen a Documento v2 - con texto visible y autocompletado tipográfico
+     * Arquitectura modular por eventos, preparada para hexagonal.
      */
 
     // ==================== MICRO EVENT EMITTER ====================
@@ -64,7 +72,6 @@
 
     // ==================== WORKER para preprocesamiento ====================
     const workerCode = `
-        // Mismos algoritmos de normalización y binarización que el escáner, adaptados para recibir ImageData.
         function normalizeAndBinarize(imageData, threshold) {
             const { data, width, height } = imageData;
             const gray = new Float32Array(width * height);
@@ -100,7 +107,6 @@
                 const val = normalized[i>>2] < threshold ? 0 : 255;
                 outData[i]=val; outData[i+1]=val; outData[i+2]=val; outData[i+3]=255;
             }
-            // Filtro de mediana 3x3 simple
             return medianFilter(new ImageData(outData, width, height));
         }
 
@@ -207,44 +213,30 @@
     }
 
     class LayoutAnalyzer {
-        /**
-         * Analiza la imagen binarizada y devuelve regiones: texto, rectángulos, líneas.
-         * @param {ImageData} binaryImage - imagen en blanco/negro (0 y 255)
-         * @returns {{type: string, bbox: {x,y,w,h}, points?: Array}}[]
-         */
         static analyze(binaryImage) {
             const { data, width, height } = binaryImage;
-            // Buscar componentes conectadas (blobs negros sobre blanco)
             const visited = new Uint8Array(width * height);
             const blobs = [];
             for (let y = 0; y < height; y++) {
                 for (let x = 0; x < width; x++) {
                     const idx = y * width + x;
-                    if (data[idx*4] === 0 && !visited[idx]) { // negro (texto)
+                    if (data[idx*4] === 0 && !visited[idx]) {
                         const blob = this._extractBlob(data, width, height, x, y, visited);
                         if (blob) blobs.push(blob);
                     }
                 }
             }
-            // Clasificar blobs usando heurísticas simples
             const regions = [];
             for (const blob of blobs) {
                 const { bbox, area } = blob;
                 const aspectRatio = bbox.w / Math.max(bbox.h, 1);
-                const density = area / (bbox.w * bbox.h); // qué tan lleno está el bounding box
-
-                if (bbox.w < 3 || bbox.h < 3) continue; // ignorar ruido muy pequeño
-
-                // Línea delgada y larga
+                const density = area / (bbox.w * bbox.h);
+                if (bbox.w < 3 || bbox.h < 3) continue;
                 if ((bbox.w > 50 && bbox.h <= 3) || (bbox.h > 50 && bbox.w <= 3)) {
                     regions.push({ type: 'line', bbox });
-                }
-                // Rectángulo grande y hueco (densidad baja y área grande)
-                else if (bbox.w > 20 && bbox.h > 20 && density < 0.3 && area > 400) {
+                } else if (bbox.w > 20 && bbox.h > 20 && density < 0.3 && area > 400) {
                     regions.push({ type: 'rectangle', bbox });
-                }
-                // Texto (resto)
-                else {
+                } else {
                     regions.push({ type: 'text', bbox });
                 }
             }
@@ -279,15 +271,14 @@
         }
     }
 
-    // ==================== OCR SERVICE (carga diferida de Tesseract) ====================
+    // ==================== OCR SERVICE ====================
     class OCRService {
         constructor() {
-            this.worker = null; // Se crea bajo demanda
+            this.worker = null;
             this.loaded = false;
         }
         async load() {
             if (this.loaded) return;
-            // Cargar Tesseract.js dinámicamente
             await new Promise((resolve, reject) => {
                 const script = document.createElement('script');
                 script.src = 'https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js';
@@ -300,7 +291,7 @@
             });
             this.loaded = true;
         }
-        onProgress = null; // callback para actualizar barra de progreso
+        onProgress = null;
         async recognize(imageData) {
             await this.load();
             const canvas = document.createElement('canvas');
@@ -308,7 +299,6 @@
             canvas.height = imageData.height;
             canvas.getContext('2d').putImageData(imageData, 0, 0);
             const { data: { words } } = await this.worker.recognize(canvas);
-            // Formatear palabras con bounding box
             return words.map(w => ({
                 text: w.text,
                 bbox: { x: w.bbox.x0, y: w.bbox.y0, w: w.bbox.x1 - w.bbox.x0, h: w.bbox.y1 - w.bbox.y0 },
@@ -319,8 +309,14 @@
 
     // ==================== PDF GENERATOR ====================
     class PDFGenerator {
-        static async generate(imageData, words, layoutRegions, filename = 'documento.pdf') {
-            // Cargar jsPDF dinámicamente
+        /**
+         * @param {ImageData} imageData - imagen original
+         * @param {Array} words - palabras del OCR con bbox
+         * @param {Array} layoutRegions - regiones de layout
+         * @param {string} fontName - nombre de la fuente a usar ('Arial', 'Times', 'Courier')
+         * @param {boolean} includeBackground - si añadir la imagen de fondo
+         */
+        static async generate(imageData, words, layoutRegions, fontName = 'Arial', includeBackground = true) {
             if (!window.jspdf) {
                 await new Promise((resolve, reject) => {
                     const script = document.createElement('script');
@@ -335,24 +331,42 @@
                 unit: 'px',
                 format: [imageData.width, imageData.height]
             });
-            // Agregar imagen de fondo (opcional, para mantener apariencia original)
-            const canvas = document.createElement('canvas');
-            canvas.width = imageData.width;
-            canvas.height = imageData.height;
-            canvas.getContext('2d').putImageData(imageData, 0, 0);
-            const imgData = canvas.toDataURL('image/jpeg', 0.8);
-            doc.addImage(imgData, 'JPEG', 0, 0, imageData.width, imageData.height);
 
-            // Agregar capa de texto invisible (seleccionable) con las palabras del OCR
-            doc.setTextColor(0, 0, 0, 0); // texto transparente
-            for (const word of words) {
-                const { x, y, w, h } = word.bbox;
-                doc.setFontSize(Math.min(h, 12));
-                doc.text(word.text, x, y + h * 0.8); // ajuste vertical aproximado
+            // 1. Fondo (opcional, atenuado para que destaque el texto reconstruido)
+            if (includeBackground) {
+                const canvas = document.createElement('canvas');
+                canvas.width = imageData.width;
+                canvas.height = imageData.height;
+                canvas.getContext('2d').putImageData(imageData, 0, 0);
+                const imgData = canvas.toDataURL('image/jpeg', 0.6);
+                doc.addImage(imgData, 'JPEG', 0, 0, imageData.width, imageData.height, '', 'FAST');
+                // Cubrir con un rectángulo blanco semitransparente para atenuar
+                doc.setFillColor(255, 255, 255);
+                doc.setGState(new doc.GState({ opacity: 0.3 }));
+                doc.rect(0, 0, imageData.width, imageData.height, 'F');
+                doc.setGState(new doc.GState({ opacity: 1 }));
             }
 
-            // Dibujar líneas y rectángulos detectados (visibles)
-            doc.setDrawColor(0); // negro
+            // 2. Texto visible con la fuente seleccionada
+            const fontMap = {
+                'Arial': 'helvetica',
+                'Times': 'times',
+                'Courier': 'courier'
+            };
+            const pdfFont = fontMap[fontName] || 'helvetica';
+            doc.setTextColor(0, 0, 0); // negro visible
+            for (const word of words) {
+                const { x, y, w, h } = word.bbox;
+                // Calcular tamaño de fuente proporcional a la altura del bounding box
+                const fontSize = Math.max(6, Math.min(h * 0.8, 20));
+                doc.setFont(pdfFont, 'normal');
+                doc.setFontSize(fontSize);
+                // Ajuste vertical para que el texto se alinee con la línea base
+                doc.text(word.text, x, y + h * 0.8);
+            }
+
+            // 3. Dibujar líneas y rectángulos detectados
+            doc.setDrawColor(0);
             doc.setLineWidth(1);
             for (const reg of layoutRegions) {
                 if (reg.type === 'line') {
@@ -362,37 +376,34 @@
                 }
             }
 
-            const pdfBlob = doc.output('blob');
-            return pdfBlob;
+            return doc.output('blob');
         }
     }
 
     // ==================== UI CONTROLLER ====================
     class UIController {
         constructor() {
-            // Elementos DOM
             this.statusDiv = document.getElementById('status');
             this.dropzone = document.getElementById('dropzone');
             this.loadBtn = document.getElementById('loadBtn');
             this.simulateBtn = document.getElementById('simulateBtn');
             this.convertBtn = document.getElementById('convertBtn');
             this.modeSelect = document.getElementById('modeSelect');
+            this.fontSelect = document.getElementById('fontSelect');
+            this.bgCheckbox = document.getElementById('bgCheckbox');
             this.progressDiv = document.getElementById('progress');
             this.progressBar = document.getElementById('progressBar');
             this.resultContainer = document.getElementById('resultContainer');
             this.previewContainer = document.getElementById('previewContainer');
 
-            // Servicios
             this.fileLoader = new FileLoader(this.dropzone, this.loadBtn);
             this.preprocessor = new Preprocessor(preprocessWorker);
             this.ocrService = new OCRService();
 
-            // Estado
             this.currentImageData = null;
             this.processedImageData = null;
             this.layoutRegions = [];
 
-            // Eventos
             this.fileLoader.on('imageLoaded', (payload) => this.onImageLoaded(payload));
             this.fileLoader.on('error', (msg) => this.setStatus(msg, 'error'));
             this.simulateBtn.addEventListener('click', () => this.simulate());
@@ -404,7 +415,6 @@
             this.showPreview(dataURL);
             this.convertBtn.disabled = false;
             this.setStatus('Imagen cargada. Pulsa "Convertir a PDF".', 'ok');
-            // Preprocesar en background para análisis de layout
             this.preprocessAndAnalyze(imageData);
         }
 
@@ -425,28 +435,26 @@
             this.setStatus('Procesando documento...', 'ok');
 
             try {
-                // 1. Asegurar que tengamos imagen procesada (si no, procesar ahora)
                 if (!this.processedImageData) {
                     this.processedImageData = await this.preprocessor.process(this.currentImageData, 120);
                     this.layoutRegions = LayoutAnalyzer.analyze(this.processedImageData);
                 }
 
-                // 2. OCR con Tesseract
                 this.setStatus('Reconociendo texto (OCR)...', 'ok');
                 this.ocrService.onProgress = (m) => {
                     if (m.status === 'recognizing text') {
                         const progress = m.progress || 0;
-                        this.setProgress(progress * 0.7, true); // 0-70% para OCR
+                        this.setProgress(progress * 0.7, true);
                     }
                 };
                 const words = await this.ocrService.recognize(this.processedImageData);
 
-                // 3. Generar PDF
                 this.setStatus('Generando PDF...', 'ok');
                 this.setProgress(0.8, true);
-                const pdfBlob = await PDFGenerator.generate(this.processedImageData, words, this.layoutRegions);
+                const fontName = this.fontSelect.value;
+                const includeBg = this.bgCheckbox.checked;
+                const pdfBlob = await PDFGenerator.generate(this.processedImageData, words, this.layoutRegions, fontName, includeBg);
 
-                // 4. Ofrecer descarga
                 this.setProgress(1.0, true);
                 const url = URL.createObjectURL(pdfBlob);
                 this.resultContainer.innerHTML = `<a href="${url}" download="documento_convertido.pdf">Descargar PDF</a>`;
@@ -472,7 +480,6 @@
             this.statusDiv.className = `status ${type}`;
         }
 
-        // Simulación con imagen sintética
         simulate() {
             const w = 640, h = 400;
             const canvas = document.createElement('canvas');
@@ -489,10 +496,12 @@
             ctx.strokeRect(30, 100, 200, 60);
             ctx.font = '16px sans-serif';
             ctx.fillText('Texto dentro del recuadro', 40, 130);
+            // Añadir espacios entre palabras variados
+            ctx.fillText('Palabra1    Palabra2   Palabra3', 30, 200);
             const imageData = ctx.getImageData(0, 0, w, h);
             const dataURL = canvas.toDataURL();
             this.onImageLoaded({ imageData, dataURL });
-            this.setStatus('Imagen de muestra cargada.', 'ok');
+            this.setStatus('Imagen de muestra cargada. Espacios incluidos.', 'ok');
         }
     }
 
