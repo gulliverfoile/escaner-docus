@@ -3,25 +3,20 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Conversor de Imagen a Documento</title>
+    <title>Copiador Geométrico de Documentos</title>
     <style>
         *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
         body { font-family: system-ui, -apple-system, sans-serif; background: #f5f5f5; color: #222; }
-        .app { max-width: 800px; margin: 0 auto; padding: 1rem; }
+        .app { max-width: 900px; margin: 0 auto; padding: 1rem; }
         .header { text-align: center; margin-bottom: 1rem; }
         .dropzone { border: 2px dashed #aaa; border-radius: 12px; padding: 2rem; text-align: center; background: #fff; margin-bottom: 1rem; transition: border-color 0.2s; }
         .dropzone.dragover { border-color: #007aff; background: #e8f0fe; }
         .preview { display: flex; gap: 1rem; flex-wrap: wrap; justify-content: center; margin: 1rem 0; }
-        .preview img { max-width: 300px; max-height: 300px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
-        .controls { display: flex; flex-wrap: wrap; gap: 0.5rem; justify-content: center; align-items: center; }
-        button, select { padding: 0.7rem 1.2rem; border-radius: 8px; font-size: 1rem; cursor: pointer; border: 1px solid #ccc; background: #fff; }
-        button { background: #007aff; color: white; border: none; font-weight: 500; transition: background 0.2s; }
+        .preview img, .preview canvas { max-width: 400px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
+        .controls { display: flex; flex-wrap: wrap; gap: 0.5rem; justify-content: center; margin: 1rem 0; }
+        button { padding: 0.7rem 1.2rem; border: none; border-radius: 8px; font-size: 1rem; cursor: pointer; background: #007aff; color: white; font-weight: 500; }
         button:disabled { background: #aaa; cursor: not-allowed; }
         button.secondary { background: #e0e0e0; color: #333; }
-        .progress { margin-top: 1rem; background: #eee; border-radius: 8px; height: 8px; overflow: hidden; display: none; }
-        .progress-bar { height: 100%; width: 0%; background: #007aff; transition: width 0.3s; }
-        .result { margin-top: 1rem; text-align: center; }
-        .result a { color: #007aff; text-decoration: none; font-weight: 500; }
         .status { padding: 0.5rem; background: #fff; border-radius: 8px; font-size: 0.9rem; text-align: center; margin: 0.5rem 0; }
         .status.error { color: #d32f2f; }
         .status.ok { color: #2e7d32; }
@@ -29,37 +24,27 @@
 </head>
 <body>
     <div class="app">
-        <div class="header"><h1>Conversor de Imagen a Documento</h1></div>
+        <div class="header"><h1>Copiador Geométrico de Documentos</h1></div>
         <div id="status" class="status">Carga una imagen o arrastra aquí</div>
         <div class="dropzone" id="dropzone">
-            <p>Arrastra una imagen aquí o</p>
+            <p>Arrastra una imagen o</p>
             <button id="loadBtn" class="secondary">Seleccionar archivo</button>
             <button id="simulateBtn" class="secondary" style="margin-left:0.5rem;">Probar con muestra</button>
         </div>
         <div class="preview" id="previewContainer"></div>
         <div class="controls">
-            <button id="convertBtn" disabled>📄 Convertir a PDF</button>
-            <select id="modeSelect" style="padding:0.5rem;">
-                <option value="text">Solo texto visible</option>
-                <option value="full">Texto + Formas</option>
-            </select>
-            <select id="fontSelect" style="padding:0.5rem;">
-                <option value="Arial">Arial (sans-serif)</option>
-                <option value="Times">Times (serif)</option>
-                <option value="Courier">Courier (monoespaciado)</option>
-            </select>
-            <label style="display:flex; align-items:center; gap:0.5rem;">
-                <input type="checkbox" id="bgCheckbox" checked> Fondo original
-            </label>
+            <button id="processBtn" disabled>🔍 Reconstruir documento</button>
+            <button id="downloadBtn" disabled>⬇️ Descargar PNG</button>
         </div>
-        <div class="progress" id="progress"><div class="progress-bar" id="progressBar"></div></div>
-        <div class="result" id="resultContainer"></div>
+        <div class="preview" id="outputContainer"></div>
     </div>
 
     <script>
     /**
-     * Conversor de Imagen a Documento v2 - con texto visible y autocompletado tipográfico
-     * Arquitectura modular por eventos, preparada para hexagonal.
+     * Copiador Geométrico de Documentos - v1.0
+     * Reconstruye un documento copiando la geometría de las letras (momentos de Hu)
+     * sin necesidad de OCR ni redes neuronales.
+     * Arquitectura modular orientada a eventos, preparada para hexagonal.
      */
 
     // ==================== MICRO EVENT EMITTER ====================
@@ -70,7 +55,7 @@
         emit(event, ...args) { if (this._events[event]) this._events[event].forEach(l => l(...args)); }
     }
 
-    // ==================== WORKER para preprocesamiento ====================
+    // ==================== WORKER: Preprocesamiento de imagen ====================
     const workerCode = `
         function normalizeAndBinarize(imageData, threshold) {
             const { data, width, height } = imageData;
@@ -107,26 +92,22 @@
                 const val = normalized[i>>2] < threshold ? 0 : 255;
                 outData[i]=val; outData[i+1]=val; outData[i+2]=val; outData[i+3]=255;
             }
-            return medianFilter(new ImageData(outData, width, height));
-        }
-
-        function medianFilter(imageData) {
-            const { data, width, height } = imageData;
-            const result = new Uint8ClampedArray(data);
+            // Filtro de mediana 3x3 simple
+            const filtered = new Uint8ClampedArray(outData);
             for (let y=1; y<height-1; y++) {
                 for (let x=1; x<width-1; x++) {
                     let whites = 0;
                     for (let dy=-1; dy<=1; dy++)
                         for (let dx=-1; dx<=1; dx++) {
                             const idx = ((y+dy)*width + (x+dx))*4;
-                            if (data[idx] === 255) whites++;
+                            if (outData[idx] === 255) whites++;
                         }
                     const median = whites >= 5 ? 255 : 0;
                     const idx = (y*width + x)*4;
-                    result[idx]=result[idx+1]=result[idx+2]=median;
+                    filtered[idx]=filtered[idx+1]=filtered[idx+2]=median;
                 }
             }
-            return new ImageData(result, width, height);
+            return new ImageData(filtered, width, height);
         }
 
         self.onmessage = function(e) {
@@ -189,7 +170,7 @@
         }
     }
 
-    class Preprocessor {
+    class ImagePreprocessor {
         constructor(worker) {
             this.worker = worker;
             this.pending = new Map();
@@ -212,45 +193,206 @@
         }
     }
 
-    class LayoutAnalyzer {
-        static analyze(binaryImage) {
+    // ==================== MOMENTOS DE HU ====================
+    class HuMoments {
+        /**
+         * Calcula los 7 momentos invariantes de Hu para una imagen binaria.
+         * @param {ImageData} imageData - imagen binaria (0 y 255)
+         * @returns {number[]} array con los 7 momentos
+         */
+        static calculate(imageData) {
+            const { data, width, height } = imageData;
+            // Momentos geométricos (m_pq)
+            let m00 = 0, m10 = 0, m01 = 0;
+            const xCoords = [], yCoords = [];
+            for (let y = 0; y < height; y++) {
+                for (let x = 0; x < width; x++) {
+                    const idx = (y * width + x) * 4;
+                    if (data[idx] === 0) { // consideramos negro como objeto
+                        m00++;
+                        m10 += x;
+                        m01 += y;
+                        xCoords.push(x);
+                        yCoords.push(y);
+                    }
+                }
+            }
+            if (m00 === 0) return [0,0,0,0,0,0,0]; // sin objeto
+
+            const xc = m10 / m00;
+            const yc = m01 / m00;
+
+            // Momentos centrales (mu_pq)
+            let mu20 = 0, mu02 = 0, mu11 = 0, mu30 = 0, mu03 = 0, mu21 = 0, mu12 = 0;
+            for (let i = 0; i < xCoords.length; i++) {
+                const dx = xCoords[i] - xc;
+                const dy = yCoords[i] - yc;
+                mu20 += dx * dx;
+                mu02 += dy * dy;
+                mu11 += dx * dy;
+                mu30 += dx * dx * dx;
+                mu03 += dy * dy * dy;
+                mu21 += dx * dx * dy;
+                mu12 += dx * dy * dy;
+            }
+
+            // Normalizar
+            const norm = Math.pow(m00, 1 + (2+2)/2); // para n20,n02,n11
+            const nu20 = mu20 / norm;
+            const nu02 = mu02 / norm;
+            const nu11 = mu11 / norm;
+            const norm3 = Math.pow(m00, 1 + (3)/2); // para n30,n03,n21,n12
+            const nu30 = mu30 / norm3;
+            const nu03 = mu03 / norm3;
+            const nu21 = mu21 / norm3;
+            const nu12 = mu12 / norm3;
+
+            // Momentos de Hu
+            const h1 = nu20 + nu02;
+            const h2 = (nu20 - nu02) * (nu20 - nu02) + 4 * nu11 * nu11;
+            const h3 = (nu30 - 3*nu12) * (nu30 - 3*nu12) + (3*nu21 - nu03) * (3*nu21 - nu03);
+            const h4 = (nu30 + nu12) * (nu30 + nu12) + (nu21 + nu03) * (nu21 + nu03);
+            const h5 = (nu30 - 3*nu12) * (nu30 + nu12) * ( (nu30 + nu12)*(nu30 + nu12) - 3*(nu21 + nu03)*(nu21 + nu03) )
+                     + (3*nu21 - nu03) * (nu21 + nu03) * ( 3*(nu30 + nu12)*(nu30 + nu12) - (nu21 + nu03)*(nu21 + nu03) );
+            const h6 = (nu20 - nu02) * ( (nu30 + nu12)*(nu30 + nu12) - (nu21 + nu03)*(nu21 + nu03) )
+                     + 4 * nu11 * (nu30 + nu12) * (nu21 + nu03);
+            const h7 = (3*nu21 - nu03) * (nu30 + nu12) * ( (nu30 + nu12)*(nu30 + nu12) - 3*(nu21 + nu03)*(nu21 + nu03) )
+                     - (nu30 - 3*nu12) * (nu21 + nu03) * ( 3*(nu30 + nu12)*(nu30 + nu12) - (nu21 + nu03)*(nu21 + nu03) );
+
+            return [h1, h2, h3, h4, h5, h6, h7];
+        }
+    }
+
+    // ==================== BASE DE DATOS DE GLIFOS ====================
+    class GlyphDatabase {
+        constructor() {
+            this.glyphs = {}; // { font: { char: [h1..h7] } }
+            this.charSet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.,;:!?¿';
+            this.fonts = ['Arial', 'Times New Roman', 'Courier New'];
+            this._buildDatabase();
+        }
+
+        _buildDatabase() {
+            // Para cada fuente y cada carácter, renderizamos y calculamos Hu
+            const canvas = document.createElement('canvas');
+            canvas.width = 64;
+            canvas.height = 64;
+            const ctx = canvas.getContext('2d');
+
+            for (const font of this.fonts) {
+                this.glyphs[font] = {};
+                for (const char of this.charSet) {
+                    ctx.clearRect(0, 0, 64, 64);
+                    ctx.fillStyle = '#000';
+                    ctx.font = `48px "${font}"`;
+                    ctx.textBaseline = 'middle';
+                    ctx.textAlign = 'center';
+                    ctx.fillText(char, 32, 32);
+                    // Recortar bounding box apretado para Hu preciso
+                    const imageData = ctx.getImageData(0, 0, 64, 64);
+                    const bbox = this._getTightBBox(imageData);
+                    if (!bbox) {
+                        // carácter inexistente (por ejemplo, '¿' en Courier?), omitimos
+                        continue;
+                    }
+                    const cropped = this._cropImageData(imageData, bbox);
+                    const hu = HuMoments.calculate(cropped);
+                    this.glyphs[font][char] = hu;
+                }
+            }
+        }
+
+        _getTightBBox(imageData) {
+            const { data, width, height } = imageData;
+            let minX = width, maxX = 0, minY = height, maxY = 0;
+            let found = false;
+            for (let y = 0; y < height; y++) {
+                for (let x = 0; x < width; x++) {
+                    const idx = (y * width + x) * 4;
+                    if (data[idx] < 128) { // oscuro
+                        if (x < minX) minX = x;
+                        if (x > maxX) maxX = x;
+                        if (y < minY) minY = y;
+                        if (y > maxY) maxY = y;
+                        found = true;
+                    }
+                }
+            }
+            return found ? { x: minX, y: minY, w: maxX - minX + 1, h: maxY - minY + 1 } : null;
+        }
+
+        _cropImageData(imageData, bbox) {
+            const { x, y, w, h } = bbox;
+            const canvas = document.createElement('canvas');
+            canvas.width = w;
+            canvas.height = h;
+            const ctx = canvas.getContext('2d');
+            ctx.putImageData(imageData, -x, -y);
+            return ctx.getImageData(0, 0, w, h);
+        }
+
+        /**
+         * Busca el carácter y fuente más cercanos a unos momentos Hu dados.
+         * @param {number[]} hu - 7 momentos
+         * @returns {{char: string, font: string, distance: number}}
+         */
+        findBestMatch(hu) {
+            let bestChar = ' ';
+            let bestFont = 'Arial';
+            let minDist = Infinity;
+            for (const font of this.fonts) {
+                const fontGlyphs = this.glyphs[font];
+                for (const char in fontGlyphs) {
+                    const dist = this._euclideanDistance(hu, fontGlyphs[char]);
+                    if (dist < minDist) {
+                        minDist = dist;
+                        bestChar = char;
+                        bestFont = font;
+                    }
+                }
+            }
+            return { char: bestChar, font: bestFont, distance: minDist };
+        }
+
+        _euclideanDistance(a, b) {
+            let sum = 0;
+            for (let i = 0; i < a.length; i++) sum += (a[i] - b[i]) ** 2;
+            return Math.sqrt(sum);
+        }
+    }
+
+    // ==================== EXTRACTOR DE COMPONENTES CONECTADAS ====================
+    class ConnectedComponents {
+        /**
+         * Extrae todas las componentes conectadas (negro sobre blanco).
+         * @param {ImageData} binaryImage
+         * @returns {Array} [{ bbox, imageData }]
+         */
+        static extract(binaryImage) {
             const { data, width, height } = binaryImage;
             const visited = new Uint8Array(width * height);
-            const blobs = [];
+            const components = [];
             for (let y = 0; y < height; y++) {
                 for (let x = 0; x < width; x++) {
                     const idx = y * width + x;
                     if (data[idx*4] === 0 && !visited[idx]) {
-                        const blob = this._extractBlob(data, width, height, x, y, visited);
-                        if (blob) blobs.push(blob);
+                        const comp = this._extractComponent(binaryImage, x, y, visited);
+                        if (comp) components.push(comp);
                     }
                 }
             }
-            const regions = [];
-            for (const blob of blobs) {
-                const { bbox, area } = blob;
-                const aspectRatio = bbox.w / Math.max(bbox.h, 1);
-                const density = area / (bbox.w * bbox.h);
-                if (bbox.w < 3 || bbox.h < 3) continue;
-                if ((bbox.w > 50 && bbox.h <= 3) || (bbox.h > 50 && bbox.w <= 3)) {
-                    regions.push({ type: 'line', bbox });
-                } else if (bbox.w > 20 && bbox.h > 20 && density < 0.3 && area > 400) {
-                    regions.push({ type: 'rectangle', bbox });
-                } else {
-                    regions.push({ type: 'text', bbox });
-                }
-            }
-            return regions;
+            return components;
         }
 
-        static _extractBlob(data, width, height, startX, startY, visited) {
+        static _extractComponent(imageData, startX, startY, visited) {
+            const { data, width, height } = imageData;
             const queue = [[startX, startY]];
             visited[startY * width + startX] = 1;
+            const pixels = [];
             let minX = startX, maxX = startX, minY = startY, maxY = startY;
-            let area = 0;
             while (queue.length) {
                 const [x, y] = queue.pop();
-                area++;
+                pixels.push({x, y});
                 minX = Math.min(minX, x); maxX = Math.max(maxX, x);
                 minY = Math.min(minY, y); maxY = Math.max(maxY, y);
                 for (let dy = -1; dy <= 1; dy++) {
@@ -267,116 +409,73 @@
                     }
                 }
             }
-            return { bbox: { x: minX, y: minY, w: maxX-minX+1, h: maxY-minY+1 }, area };
-        }
-    }
+            const w = maxX - minX + 1, h = maxY - minY + 1;
+            if (w < 2 || h < 2) return null; // ruido mínimo
 
-    // ==================== OCR SERVICE ====================
-    class OCRService {
-        constructor() {
-            this.worker = null;
-            this.loaded = false;
-        }
-        async load() {
-            if (this.loaded) return;
-            await new Promise((resolve, reject) => {
-                const script = document.createElement('script');
-                script.src = 'https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js';
-                script.onload = resolve;
-                script.onerror = () => reject(new Error('No se pudo cargar Tesseract.js'));
-                document.head.appendChild(script);
-            });
-            this.worker = await Tesseract.createWorker('spa', 1, {
-                logger: m => this.onProgress?.(m)
-            });
-            this.loaded = true;
-        }
-        onProgress = null;
-        async recognize(imageData) {
-            await this.load();
+            // Crear ImageData recortado
             const canvas = document.createElement('canvas');
-            canvas.width = imageData.width;
-            canvas.height = imageData.height;
-            canvas.getContext('2d').putImageData(imageData, 0, 0);
-            const { data: { words } } = await this.worker.recognize(canvas);
-            return words.map(w => ({
-                text: w.text,
-                bbox: { x: w.bbox.x0, y: w.bbox.y0, w: w.bbox.x1 - w.bbox.x0, h: w.bbox.y1 - w.bbox.y0 },
-                confidence: w.confidence
-            }));
-        }
-    }
-
-    // ==================== PDF GENERATOR ====================
-    class PDFGenerator {
-        /**
-         * @param {ImageData} imageData - imagen original
-         * @param {Array} words - palabras del OCR con bbox
-         * @param {Array} layoutRegions - regiones de layout
-         * @param {string} fontName - nombre de la fuente a usar ('Arial', 'Times', 'Courier')
-         * @param {boolean} includeBackground - si añadir la imagen de fondo
-         */
-        static async generate(imageData, words, layoutRegions, fontName = 'Arial', includeBackground = true) {
-            if (!window.jspdf) {
-                await new Promise((resolve, reject) => {
-                    const script = document.createElement('script');
-                    script.src = 'https://cdn.jsdelivr.net/npm/jspdf@2/dist/jspdf.umd.min.js';
-                    script.onload = resolve;
-                    script.onerror = () => reject(new Error('No se pudo cargar jsPDF'));
-                    document.head.appendChild(script);
-                });
-            }
-            const { jsPDF } = window.jspdf;
-            const doc = new jsPDF({
-                unit: 'px',
-                format: [imageData.width, imageData.height]
-            });
-
-            // 1. Fondo (opcional, atenuado para que destaque el texto reconstruido)
-            if (includeBackground) {
-                const canvas = document.createElement('canvas');
-                canvas.width = imageData.width;
-                canvas.height = imageData.height;
-                canvas.getContext('2d').putImageData(imageData, 0, 0);
-                const imgData = canvas.toDataURL('image/jpeg', 0.6);
-                doc.addImage(imgData, 'JPEG', 0, 0, imageData.width, imageData.height, '', 'FAST');
-                // Cubrir con un rectángulo blanco semitransparente para atenuar
-                doc.setFillColor(255, 255, 255);
-                doc.setGState(new doc.GState({ opacity: 0.3 }));
-                doc.rect(0, 0, imageData.width, imageData.height, 'F');
-                doc.setGState(new doc.GState({ opacity: 1 }));
-            }
-
-            // 2. Texto visible con la fuente seleccionada
-            const fontMap = {
-                'Arial': 'helvetica',
-                'Times': 'times',
-                'Courier': 'courier'
-            };
-            const pdfFont = fontMap[fontName] || 'helvetica';
-            doc.setTextColor(0, 0, 0); // negro visible
-            for (const word of words) {
-                const { x, y, w, h } = word.bbox;
-                // Calcular tamaño de fuente proporcional a la altura del bounding box
-                const fontSize = Math.max(6, Math.min(h * 0.8, 20));
-                doc.setFont(pdfFont, 'normal');
-                doc.setFontSize(fontSize);
-                // Ajuste vertical para que el texto se alinee con la línea base
-                doc.text(word.text, x, y + h * 0.8);
-            }
-
-            // 3. Dibujar líneas y rectángulos detectados
-            doc.setDrawColor(0);
-            doc.setLineWidth(1);
-            for (const reg of layoutRegions) {
-                if (reg.type === 'line') {
-                    doc.line(reg.bbox.x, reg.bbox.y, reg.bbox.x + reg.bbox.w, reg.bbox.y + reg.bbox.h);
-                } else if (reg.type === 'rectangle') {
-                    doc.rect(reg.bbox.x, reg.bbox.y, reg.bbox.w, reg.bbox.h);
+            canvas.width = w;
+            canvas.height = h;
+            const ctx = canvas.getContext('2d');
+            const compImageData = ctx.createImageData(w, h);
+            for (let y = 0; y < h; y++) {
+                for (let x = 0; x < w; x++) {
+                    const srcIdx = ((minY + y) * width + (minX + x)) * 4;
+                    const dstIdx = (y * w + x) * 4;
+                    // Copiar píxel si pertenece al componente, sino blanco
+                    if (data[srcIdx] === 0) {
+                        compImageData.data[dstIdx] = 0;
+                        compImageData.data[dstIdx+1] = 0;
+                        compImageData.data[dstIdx+2] = 0;
+                        compImageData.data[dstIdx+3] = 255;
+                    } else {
+                        compImageData.data[dstIdx] = 255;
+                        compImageData.data[dstIdx+1] = 255;
+                        compImageData.data[dstIdx+2] = 255;
+                        compImageData.data[dstIdx+3] = 255;
+                    }
                 }
             }
+            return { bbox: { x: minX, y: minY, w, h }, imageData: compImageData };
+        }
+    }
 
-            return doc.output('blob');
+    // ==================== RECONSTRUCTOR DEL DOCUMENTO ====================
+    class DocumentReconstructor {
+        /**
+         * Reconstruye el documento combinando las componentes clasificadas.
+         * @param {object} sourceImageData - imagen original (ImageData) para fondo
+         * @param {Array} components - resultado de clasificar cada componente con { bbox, char, font }
+         * @returns {HTMLCanvasElement}
+         */
+        static reconstruct(sourceImageData, components) {
+            const canvas = document.createElement('canvas');
+            canvas.width = sourceImageData.width;
+            canvas.height = sourceImageData.height;
+            const ctx = canvas.getContext('2d');
+
+            // Fondo blanco
+            ctx.fillStyle = '#ffffff';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+            // Opcional: dibujar imagen original atenuada (para sellos, etc.)
+            // No lo incluimos para mantener pureza geométrica.
+
+            // Dibujar cada carácter con la fuente y posición originales
+            for (const comp of components) {
+                const { bbox, char, font } = comp;
+                const fontSize = Math.min(bbox.h * 1.2, 48); // ajustar tamaño
+                ctx.fillStyle = '#000000';
+                ctx.font = `${fontSize}px "${font}"`;
+                ctx.textBaseline = 'top';
+                ctx.textAlign = 'left';
+                // Ajustar posición para centrar en bounding box original
+                const textWidth = ctx.measureText(char).width;
+                const xOffset = (bbox.w - textWidth) / 2;
+                const yOffset = (bbox.h - fontSize) / 2;
+                ctx.fillText(char, bbox.x + xOffset, bbox.y + yOffset);
+            }
+            return canvas;
         }
     }
 
@@ -387,92 +486,93 @@
             this.dropzone = document.getElementById('dropzone');
             this.loadBtn = document.getElementById('loadBtn');
             this.simulateBtn = document.getElementById('simulateBtn');
-            this.convertBtn = document.getElementById('convertBtn');
-            this.modeSelect = document.getElementById('modeSelect');
-            this.fontSelect = document.getElementById('fontSelect');
-            this.bgCheckbox = document.getElementById('bgCheckbox');
-            this.progressDiv = document.getElementById('progress');
-            this.progressBar = document.getElementById('progressBar');
-            this.resultContainer = document.getElementById('resultContainer');
+            this.processBtn = document.getElementById('processBtn');
+            this.downloadBtn = document.getElementById('downloadBtn');
             this.previewContainer = document.getElementById('previewContainer');
+            this.outputContainer = document.getElementById('outputContainer');
 
             this.fileLoader = new FileLoader(this.dropzone, this.loadBtn);
-            this.preprocessor = new Preprocessor(preprocessWorker);
-            this.ocrService = new OCRService();
+            this.preprocessor = new ImagePreprocessor(preprocessWorker);
+            this.glyphDB = new GlyphDatabase();
 
-            this.currentImageData = null;
-            this.processedImageData = null;
-            this.layoutRegions = [];
+            this.sourceImageData = null;
+            this.binaryImageData = null;
+            this.components = [];
 
             this.fileLoader.on('imageLoaded', (payload) => this.onImageLoaded(payload));
             this.fileLoader.on('error', (msg) => this.setStatus(msg, 'error'));
             this.simulateBtn.addEventListener('click', () => this.simulate());
-            this.convertBtn.addEventListener('click', () => this.convert());
+            this.processBtn.addEventListener('click', () => this.process());
+            this.downloadBtn.addEventListener('click', () => this.downloadResult());
         }
 
         onImageLoaded({ imageData, dataURL }) {
-            this.currentImageData = imageData;
+            this.sourceImageData = imageData;
             this.showPreview(dataURL);
-            this.convertBtn.disabled = false;
-            this.setStatus('Imagen cargada. Pulsa "Convertir a PDF".', 'ok');
-            this.preprocessAndAnalyze(imageData);
+            this.processBtn.disabled = false;
+            this.downloadBtn.disabled = true;
+            this.setStatus('Imagen cargada. Pulsa "Reconstruir documento".', 'ok');
         }
 
-        async preprocessAndAnalyze(imageData) {
-            try {
-                const processed = await this.preprocessor.process(imageData, 120);
-                this.processedImageData = processed;
-                this.layoutRegions = LayoutAnalyzer.analyze(processed);
-                this.setStatus(`Análisis completado: ${this.layoutRegions.filter(r=>r.type==='text').length} regiones de texto, ${this.layoutRegions.filter(r=>r.type!=='text').length} formas.`, 'ok');
-            } catch (e) {
-                this.setStatus('Error en preprocesamiento: ' + e.message, 'error');
-            }
-        }
-
-        async convert() {
-            if (!this.currentImageData) return;
-            this.setProgress(0, true);
-            this.setStatus('Procesando documento...', 'ok');
+        async process() {
+            if (!this.sourceImageData) return;
+            this.setStatus('Preprocesando imagen...', 'ok');
+            this.processBtn.disabled = true;
 
             try {
-                if (!this.processedImageData) {
-                    this.processedImageData = await this.preprocessor.process(this.currentImageData, 120);
-                    this.layoutRegions = LayoutAnalyzer.analyze(this.processedImageData);
+                // 1. Binarizar
+                this.binaryImageData = await this.preprocessor.process(this.sourceImageData, 120);
+                // 2. Extraer componentes
+                this.components = ConnectedComponents.extract(this.binaryImageData);
+                this.setStatus(`Componentes detectadas: ${this.components.length}. Clasificando...`, 'ok');
+
+                // 3. Clasificar cada componente con Hu
+                const classified = [];
+                for (const comp of this.components) {
+                    const hu = HuMoments.calculate(comp.imageData);
+                    const match = this.glyphDB.findBestMatch(hu);
+                    // Umbral de distancia para considerar válido (ajustar empíricamente)
+                    if (match.distance < 0.5) { // valor experimental
+                        classified.push({
+                            bbox: comp.bbox,
+                            char: match.char,
+                            font: match.font,
+                            distance: match.distance
+                        });
+                    } else {
+                        // Si no coincide bien, lo dejamos como imagen original (no reconstruido)
+                        // Para simplificar, ignoramos (queda hueco) o podríamos pegar el bitmap.
+                    }
                 }
 
-                this.setStatus('Reconociendo texto (OCR)...', 'ok');
-                this.ocrService.onProgress = (m) => {
-                    if (m.status === 'recognizing text') {
-                        const progress = m.progress || 0;
-                        this.setProgress(progress * 0.7, true);
-                    }
-                };
-                const words = await this.ocrService.recognize(this.processedImageData);
-
-                this.setStatus('Generando PDF...', 'ok');
-                this.setProgress(0.8, true);
-                const fontName = this.fontSelect.value;
-                const includeBg = this.bgCheckbox.checked;
-                const pdfBlob = await PDFGenerator.generate(this.processedImageData, words, this.layoutRegions, fontName, includeBg);
-
-                this.setProgress(1.0, true);
-                const url = URL.createObjectURL(pdfBlob);
-                this.resultContainer.innerHTML = `<a href="${url}" download="documento_convertido.pdf">Descargar PDF</a>`;
-                this.setStatus('¡Documento listo!', 'ok');
-                setTimeout(() => this.setProgress(0, false), 1000);
+                // 4. Reconstruir documento
+                const resultCanvas = DocumentReconstructor.reconstruct(this.sourceImageData, classified);
+                this.showOutput(resultCanvas);
+                this.downloadBtn.disabled = false;
+                this.setStatus(`Documento reconstruido con ${classified.length} caracteres.`, 'ok');
             } catch (error) {
                 this.setStatus('Error: ' + error.message, 'error');
-                this.setProgress(0, false);
             }
+            this.processBtn.disabled = false;
         }
 
         showPreview(dataURL) {
-            this.previewContainer.innerHTML = `<img src="${dataURL}" alt="Vista previa">`;
+            this.previewContainer.innerHTML = `<img src="${dataURL}" alt="Original">`;
         }
 
-        setProgress(value, visible) {
-            this.progressDiv.style.display = visible ? 'block' : 'none';
-            this.progressBar.style.width = (value * 100) + '%';
+        showOutput(canvas) {
+            this.outputContainer.innerHTML = '';
+            this.outputContainer.appendChild(canvas);
+            // Guardar referencia para descarga
+            this.resultCanvas = canvas;
+        }
+
+        downloadResult() {
+            if (!this.resultCanvas) return;
+            const link = document.createElement('a');
+            link.download = 'documento_reconstruido.png';
+            link.href = this.resultCanvas.toDataURL('image/png');
+            link.click();
         }
 
         setStatus(message, type = 'ok') {
@@ -481,27 +581,23 @@
         }
 
         simulate() {
-            const w = 640, h = 400;
+            const w = 800, h = 200;
             const canvas = document.createElement('canvas');
             canvas.width = w; canvas.height = h;
             const ctx = canvas.getContext('2d');
-            ctx.fillStyle = '#fff';
+            ctx.fillStyle = '#ffffff';
             ctx.fillRect(0, 0, w, h);
-            ctx.fillStyle = '#000';
-            ctx.font = '20px serif';
-            ctx.fillText('Documento simulado', 30, 50);
-            ctx.fillText('Con texto y un recuadro:', 30, 80);
-            ctx.strokeStyle = '#000';
-            ctx.lineWidth = 2;
-            ctx.strokeRect(30, 100, 200, 60);
-            ctx.font = '16px sans-serif';
-            ctx.fillText('Texto dentro del recuadro', 40, 130);
-            // Añadir espacios entre palabras variados
-            ctx.fillText('Palabra1    Palabra2   Palabra3', 30, 200);
+            ctx.fillStyle = '#000000';
+            ctx.font = '32px "Times New Roman"';
+            ctx.fillText('Documento de prueba', 30, 60);
+            ctx.font = '24px "Arial"';
+            ctx.fillText('con diferentes fuentes', 30, 100);
+            ctx.font = '20px "Courier New"';
+            ctx.fillText('y espacios   irregulares.', 30, 140);
             const imageData = ctx.getImageData(0, 0, w, h);
             const dataURL = canvas.toDataURL();
             this.onImageLoaded({ imageData, dataURL });
-            this.setStatus('Imagen de muestra cargada. Espacios incluidos.', 'ok');
+            this.setStatus('Imagen de muestra generada.', 'ok');
         }
     }
 
