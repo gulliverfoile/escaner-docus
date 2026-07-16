@@ -1,0 +1,503 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Conversor de Imagen a Documento</title>
+    <style>
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: system-ui, -apple-system, sans-serif; background: #f5f5f5; color: #222; }
+        .app { max-width: 800px; margin: 0 auto; padding: 1rem; }
+        .header { text-align: center; margin-bottom: 1rem; }
+        .dropzone { border: 2px dashed #aaa; border-radius: 12px; padding: 2rem; text-align: center; background: #fff; margin-bottom: 1rem; transition: border-color 0.2s; }
+        .dropzone.dragover { border-color: #007aff; background: #e8f0fe; }
+        .preview { display: flex; gap: 1rem; flex-wrap: wrap; justify-content: center; margin: 1rem 0; }
+        .preview img { max-width: 300px; max-height: 300px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
+        .controls { display: flex; flex-wrap: wrap; gap: 0.5rem; justify-content: center; }
+        button { padding: 0.7rem 1.2rem; border: none; border-radius: 8px; font-size: 1rem; cursor: pointer; background: #007aff; color: white; font-weight: 500; transition: background 0.2s; }
+        button:disabled { background: #aaa; cursor: not-allowed; }
+        button.secondary { background: #e0e0e0; color: #333; }
+        .progress { margin-top: 1rem; background: #eee; border-radius: 8px; height: 8px; overflow: hidden; display: none; }
+        .progress-bar { height: 100%; width: 0%; background: #007aff; transition: width 0.3s; }
+        .result { margin-top: 1rem; text-align: center; }
+        .result a { color: #007aff; text-decoration: none; font-weight: 500; }
+        .status { padding: 0.5rem; background: #fff; border-radius: 8px; font-size: 0.9rem; text-align: center; margin: 0.5rem 0; }
+        .status.error { color: #d32f2f; }
+        .status.ok { color: #2e7d32; }
+    </style>
+</head>
+<body>
+    <div class="app">
+        <div class="header"><h1>Conversor de Imagen a Documento</h1></div>
+        <div id="status" class="status">Carga una imagen o arrastra aquí</div>
+        <div class="dropzone" id="dropzone">
+            <p>Arrastra una imagen aquí o</p>
+            <button id="loadBtn" class="secondary">Seleccionar archivo</button>
+            <button id="simulateBtn" class="secondary" style="margin-left:0.5rem;">Probar con muestra</button>
+        </div>
+        <div class="preview" id="previewContainer"></div>
+        <div class="controls">
+            <button id="convertBtn" disabled>📄 Convertir a PDF</button>
+            <select id="modeSelect" style="padding:0.5rem; border-radius:8px; border:1px solid #ccc;">
+                <option value="text">Solo texto</option>
+                <option value="full">Texto + Formas</option>
+            </select>
+        </div>
+        <div class="progress" id="progress"><div class="progress-bar" id="progressBar"></div></div>
+        <div class="result" id="resultContainer"></div>
+    </div>
+
+    <script>
+    /**
+     * Conversor de Imagen a Documento (PDF con texto y formas)
+     * Arquitectura modular, eventos, preparado para hexagonal.
+     * Dependencias externas: Tesseract.js, jsPDF (cargadas bajo demanda)
+     */
+
+    // ==================== MICRO EVENT EMITTER ====================
+    class EventEmitter {
+        constructor() { this._events = {}; }
+        on(event, listener) { if (!this._events[event]) this._events[event] = []; this._events[event].push(listener); return this; }
+        off(event, listener) { if (!this._events[event]) return; this._events[event] = this._events[event].filter(l => l !== listener); }
+        emit(event, ...args) { if (this._events[event]) this._events[event].forEach(l => l(...args)); }
+    }
+
+    // ==================== WORKER para preprocesamiento ====================
+    const workerCode = `
+        // Mismos algoritmos de normalización y binarización que el escáner, adaptados para recibir ImageData.
+        function normalizeAndBinarize(imageData, threshold) {
+            const { data, width, height } = imageData;
+            const gray = new Float32Array(width * height);
+            for (let i = 0; i < data.length; i += 4) gray[i>>2] = 0.299*data[i] + 0.587*data[i+1] + 0.114*data[i+2];
+
+            const blurSize = 41, half = Math.floor(blurSize/2);
+            const integral = new Float64Array(width * height);
+            for (let y=0; y<height; y++) {
+                let rowSum = 0;
+                for (let x=0; x<width; x++) {
+                    rowSum += gray[y*width + x];
+                    integral[y*width + x] = (y===0) ? rowSum : integral[(y-1)*width + x] + rowSum;
+                }
+            }
+            const blurred = new Float32Array(width * height);
+            for (let y=0; y<height; y++) {
+                for (let x=0; x<width; x++) {
+                    const x1 = Math.max(x - half, 0), y1 = Math.max(y - half, 0);
+                    const x2 = Math.min(x + half, width-1), y2 = Math.min(y + half, height-1);
+                    let sum = integral[y2*width + x2];
+                    if (y1>0) sum -= integral[(y1-1)*width + x2];
+                    if (x1>0) sum -= integral[y2*width + (x1-1)];
+                    if (y1>0 && x1>0) sum += integral[(y1-1)*width + (x1-1)];
+                    const area = (x2-x1+1)*(y2-y1+1);
+                    blurred[y*width + x] = sum / area;
+                }
+            }
+            const normalized = new Float32Array(width * height);
+            for (let i=0; i<normalized.length; i++) normalized[i] = Math.min(255, (gray[i]/(blurred[i]+0.001))*255);
+
+            const outData = new Uint8ClampedArray(data.length);
+            for (let i=0; i<data.length; i+=4) {
+                const val = normalized[i>>2] < threshold ? 0 : 255;
+                outData[i]=val; outData[i+1]=val; outData[i+2]=val; outData[i+3]=255;
+            }
+            // Filtro de mediana 3x3 simple
+            return medianFilter(new ImageData(outData, width, height));
+        }
+
+        function medianFilter(imageData) {
+            const { data, width, height } = imageData;
+            const result = new Uint8ClampedArray(data);
+            for (let y=1; y<height-1; y++) {
+                for (let x=1; x<width-1; x++) {
+                    let whites = 0;
+                    for (let dy=-1; dy<=1; dy++)
+                        for (let dx=-1; dx<=1; dx++) {
+                            const idx = ((y+dy)*width + (x+dx))*4;
+                            if (data[idx] === 255) whites++;
+                        }
+                    const median = whites >= 5 ? 255 : 0;
+                    const idx = (y*width + x)*4;
+                    result[idx]=result[idx+1]=result[idx+2]=median;
+                }
+            }
+            return new ImageData(result, width, height);
+        }
+
+        self.onmessage = function(e) {
+            const { id, type, payload } = e.data;
+            if (type === 'preprocess') {
+                const { imageData, threshold } = payload;
+                const processed = normalizeAndBinarize(imageData, threshold || 120);
+                self.postMessage({ id, result: processed }, [processed.data.buffer]);
+            }
+        };
+    `;
+    const workerBlob = new Blob([workerCode], { type: 'application/javascript' });
+    const workerUrl = URL.createObjectURL(workerBlob);
+    const preprocessWorker = new Worker(workerUrl);
+
+    // ==================== SERVICIOS ====================
+    class FileLoader extends EventEmitter {
+        constructor(dropzone, fileInput) {
+            super();
+            this.dropzone = dropzone;
+            this.fileInput = fileInput;
+            this._setupEvents();
+        }
+        _setupEvents() {
+            this.dropzone.addEventListener('dragover', (e) => {
+                e.preventDefault();
+                this.dropzone.classList.add('dragover');
+            });
+            this.dropzone.addEventListener('dragleave', () => this.dropzone.classList.remove('dragover'));
+            this.dropzone.addEventListener('drop', (e) => {
+                e.preventDefault();
+                this.dropzone.classList.remove('dragover');
+                const files = e.dataTransfer.files;
+                if (files.length) this._loadFile(files[0]);
+            });
+            this.fileInput.addEventListener('change', (e) => {
+                if (e.target.files.length) this._loadFile(e.target.files[0]);
+            });
+        }
+        _loadFile(file) {
+            if (!file.type.startsWith('image/')) {
+                this.emit('error', 'El archivo no es una imagen.');
+                return;
+            }
+            const reader = new FileReader();
+            reader.onload = (e) => {
+                const img = new Image();
+                img.onload = () => {
+                    const canvas = document.createElement('canvas');
+                    canvas.width = img.width;
+                    canvas.height = img.height;
+                    const ctx = canvas.getContext('2d');
+                    ctx.drawImage(img, 0, 0);
+                    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+                    this.emit('imageLoaded', { imageData, dataURL: canvas.toDataURL() });
+                };
+                img.src = e.target.result;
+            };
+            reader.readAsDataURL(file);
+        }
+    }
+
+    class Preprocessor {
+        constructor(worker) {
+            this.worker = worker;
+            this.pending = new Map();
+            this.nextId = 1;
+            this.worker.onmessage = (e) => {
+                const { id, result } = e.data;
+                const p = this.pending.get(id);
+                if (p) {
+                    this.pending.delete(id);
+                    p.resolve(result);
+                }
+            };
+        }
+        async process(imageData, threshold = 120) {
+            return new Promise((resolve, reject) => {
+                const id = this.nextId++;
+                this.pending.set(id, { resolve, reject });
+                this.worker.postMessage({ id, type: 'preprocess', payload: { imageData, threshold } }, [imageData.data.buffer]);
+            });
+        }
+    }
+
+    class LayoutAnalyzer {
+        /**
+         * Analiza la imagen binarizada y devuelve regiones: texto, rectángulos, líneas.
+         * @param {ImageData} binaryImage - imagen en blanco/negro (0 y 255)
+         * @returns {{type: string, bbox: {x,y,w,h}, points?: Array}}[]
+         */
+        static analyze(binaryImage) {
+            const { data, width, height } = binaryImage;
+            // Buscar componentes conectadas (blobs negros sobre blanco)
+            const visited = new Uint8Array(width * height);
+            const blobs = [];
+            for (let y = 0; y < height; y++) {
+                for (let x = 0; x < width; x++) {
+                    const idx = y * width + x;
+                    if (data[idx*4] === 0 && !visited[idx]) { // negro (texto)
+                        const blob = this._extractBlob(data, width, height, x, y, visited);
+                        if (blob) blobs.push(blob);
+                    }
+                }
+            }
+            // Clasificar blobs usando heurísticas simples
+            const regions = [];
+            for (const blob of blobs) {
+                const { bbox, area } = blob;
+                const aspectRatio = bbox.w / Math.max(bbox.h, 1);
+                const density = area / (bbox.w * bbox.h); // qué tan lleno está el bounding box
+
+                if (bbox.w < 3 || bbox.h < 3) continue; // ignorar ruido muy pequeño
+
+                // Línea delgada y larga
+                if ((bbox.w > 50 && bbox.h <= 3) || (bbox.h > 50 && bbox.w <= 3)) {
+                    regions.push({ type: 'line', bbox });
+                }
+                // Rectángulo grande y hueco (densidad baja y área grande)
+                else if (bbox.w > 20 && bbox.h > 20 && density < 0.3 && area > 400) {
+                    regions.push({ type: 'rectangle', bbox });
+                }
+                // Texto (resto)
+                else {
+                    regions.push({ type: 'text', bbox });
+                }
+            }
+            return regions;
+        }
+
+        static _extractBlob(data, width, height, startX, startY, visited) {
+            const queue = [[startX, startY]];
+            visited[startY * width + startX] = 1;
+            let minX = startX, maxX = startX, minY = startY, maxY = startY;
+            let area = 0;
+            while (queue.length) {
+                const [x, y] = queue.pop();
+                area++;
+                minX = Math.min(minX, x); maxX = Math.max(maxX, x);
+                minY = Math.min(minY, y); maxY = Math.max(maxY, y);
+                for (let dy = -1; dy <= 1; dy++) {
+                    for (let dx = -1; dx <= 1; dx++) {
+                        if (dx === 0 && dy === 0) continue;
+                        const nx = x + dx, ny = y + dy;
+                        if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
+                            const idx = ny * width + nx;
+                            if (data[idx*4] === 0 && !visited[idx]) {
+                                visited[idx] = 1;
+                                queue.push([nx, ny]);
+                            }
+                        }
+                    }
+                }
+            }
+            return { bbox: { x: minX, y: minY, w: maxX-minX+1, h: maxY-minY+1 }, area };
+        }
+    }
+
+    // ==================== OCR SERVICE (carga diferida de Tesseract) ====================
+    class OCRService {
+        constructor() {
+            this.worker = null; // Se crea bajo demanda
+            this.loaded = false;
+        }
+        async load() {
+            if (this.loaded) return;
+            // Cargar Tesseract.js dinámicamente
+            await new Promise((resolve, reject) => {
+                const script = document.createElement('script');
+                script.src = 'https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js';
+                script.onload = resolve;
+                script.onerror = () => reject(new Error('No se pudo cargar Tesseract.js'));
+                document.head.appendChild(script);
+            });
+            this.worker = await Tesseract.createWorker('spa', 1, {
+                logger: m => this.onProgress?.(m)
+            });
+            this.loaded = true;
+        }
+        onProgress = null; // callback para actualizar barra de progreso
+        async recognize(imageData) {
+            await this.load();
+            const canvas = document.createElement('canvas');
+            canvas.width = imageData.width;
+            canvas.height = imageData.height;
+            canvas.getContext('2d').putImageData(imageData, 0, 0);
+            const { data: { words } } = await this.worker.recognize(canvas);
+            // Formatear palabras con bounding box
+            return words.map(w => ({
+                text: w.text,
+                bbox: { x: w.bbox.x0, y: w.bbox.y0, w: w.bbox.x1 - w.bbox.x0, h: w.bbox.y1 - w.bbox.y0 },
+                confidence: w.confidence
+            }));
+        }
+    }
+
+    // ==================== PDF GENERATOR ====================
+    class PDFGenerator {
+        static async generate(imageData, words, layoutRegions, filename = 'documento.pdf') {
+            // Cargar jsPDF dinámicamente
+            if (!window.jspdf) {
+                await new Promise((resolve, reject) => {
+                    const script = document.createElement('script');
+                    script.src = 'https://cdn.jsdelivr.net/npm/jspdf@2/dist/jspdf.umd.min.js';
+                    script.onload = resolve;
+                    script.onerror = () => reject(new Error('No se pudo cargar jsPDF'));
+                    document.head.appendChild(script);
+                });
+            }
+            const { jsPDF } = window.jspdf;
+            const doc = new jsPDF({
+                unit: 'px',
+                format: [imageData.width, imageData.height]
+            });
+            // Agregar imagen de fondo (opcional, para mantener apariencia original)
+            const canvas = document.createElement('canvas');
+            canvas.width = imageData.width;
+            canvas.height = imageData.height;
+            canvas.getContext('2d').putImageData(imageData, 0, 0);
+            const imgData = canvas.toDataURL('image/jpeg', 0.8);
+            doc.addImage(imgData, 'JPEG', 0, 0, imageData.width, imageData.height);
+
+            // Agregar capa de texto invisible (seleccionable) con las palabras del OCR
+            doc.setTextColor(0, 0, 0, 0); // texto transparente
+            for (const word of words) {
+                const { x, y, w, h } = word.bbox;
+                doc.setFontSize(Math.min(h, 12));
+                doc.text(word.text, x, y + h * 0.8); // ajuste vertical aproximado
+            }
+
+            // Dibujar líneas y rectángulos detectados (visibles)
+            doc.setDrawColor(0); // negro
+            doc.setLineWidth(1);
+            for (const reg of layoutRegions) {
+                if (reg.type === 'line') {
+                    doc.line(reg.bbox.x, reg.bbox.y, reg.bbox.x + reg.bbox.w, reg.bbox.y + reg.bbox.h);
+                } else if (reg.type === 'rectangle') {
+                    doc.rect(reg.bbox.x, reg.bbox.y, reg.bbox.w, reg.bbox.h);
+                }
+            }
+
+            const pdfBlob = doc.output('blob');
+            return pdfBlob;
+        }
+    }
+
+    // ==================== UI CONTROLLER ====================
+    class UIController {
+        constructor() {
+            // Elementos DOM
+            this.statusDiv = document.getElementById('status');
+            this.dropzone = document.getElementById('dropzone');
+            this.loadBtn = document.getElementById('loadBtn');
+            this.simulateBtn = document.getElementById('simulateBtn');
+            this.convertBtn = document.getElementById('convertBtn');
+            this.modeSelect = document.getElementById('modeSelect');
+            this.progressDiv = document.getElementById('progress');
+            this.progressBar = document.getElementById('progressBar');
+            this.resultContainer = document.getElementById('resultContainer');
+            this.previewContainer = document.getElementById('previewContainer');
+
+            // Servicios
+            this.fileLoader = new FileLoader(this.dropzone, this.loadBtn);
+            this.preprocessor = new Preprocessor(preprocessWorker);
+            this.ocrService = new OCRService();
+
+            // Estado
+            this.currentImageData = null;
+            this.processedImageData = null;
+            this.layoutRegions = [];
+
+            // Eventos
+            this.fileLoader.on('imageLoaded', (payload) => this.onImageLoaded(payload));
+            this.fileLoader.on('error', (msg) => this.setStatus(msg, 'error'));
+            this.simulateBtn.addEventListener('click', () => this.simulate());
+            this.convertBtn.addEventListener('click', () => this.convert());
+        }
+
+        onImageLoaded({ imageData, dataURL }) {
+            this.currentImageData = imageData;
+            this.showPreview(dataURL);
+            this.convertBtn.disabled = false;
+            this.setStatus('Imagen cargada. Pulsa "Convertir a PDF".', 'ok');
+            // Preprocesar en background para análisis de layout
+            this.preprocessAndAnalyze(imageData);
+        }
+
+        async preprocessAndAnalyze(imageData) {
+            try {
+                const processed = await this.preprocessor.process(imageData, 120);
+                this.processedImageData = processed;
+                this.layoutRegions = LayoutAnalyzer.analyze(processed);
+                this.setStatus(`Análisis completado: ${this.layoutRegions.filter(r=>r.type==='text').length} regiones de texto, ${this.layoutRegions.filter(r=>r.type!=='text').length} formas.`, 'ok');
+            } catch (e) {
+                this.setStatus('Error en preprocesamiento: ' + e.message, 'error');
+            }
+        }
+
+        async convert() {
+            if (!this.currentImageData) return;
+            this.setProgress(0, true);
+            this.setStatus('Procesando documento...', 'ok');
+
+            try {
+                // 1. Asegurar que tengamos imagen procesada (si no, procesar ahora)
+                if (!this.processedImageData) {
+                    this.processedImageData = await this.preprocessor.process(this.currentImageData, 120);
+                    this.layoutRegions = LayoutAnalyzer.analyze(this.processedImageData);
+                }
+
+                // 2. OCR con Tesseract
+                this.setStatus('Reconociendo texto (OCR)...', 'ok');
+                this.ocrService.onProgress = (m) => {
+                    if (m.status === 'recognizing text') {
+                        const progress = m.progress || 0;
+                        this.setProgress(progress * 0.7, true); // 0-70% para OCR
+                    }
+                };
+                const words = await this.ocrService.recognize(this.processedImageData);
+
+                // 3. Generar PDF
+                this.setStatus('Generando PDF...', 'ok');
+                this.setProgress(0.8, true);
+                const pdfBlob = await PDFGenerator.generate(this.processedImageData, words, this.layoutRegions);
+
+                // 4. Ofrecer descarga
+                this.setProgress(1.0, true);
+                const url = URL.createObjectURL(pdfBlob);
+                this.resultContainer.innerHTML = `<a href="${url}" download="documento_convertido.pdf">Descargar PDF</a>`;
+                this.setStatus('¡Documento listo!', 'ok');
+                setTimeout(() => this.setProgress(0, false), 1000);
+            } catch (error) {
+                this.setStatus('Error: ' + error.message, 'error');
+                this.setProgress(0, false);
+            }
+        }
+
+        showPreview(dataURL) {
+            this.previewContainer.innerHTML = `<img src="${dataURL}" alt="Vista previa">`;
+        }
+
+        setProgress(value, visible) {
+            this.progressDiv.style.display = visible ? 'block' : 'none';
+            this.progressBar.style.width = (value * 100) + '%';
+        }
+
+        setStatus(message, type = 'ok') {
+            this.statusDiv.textContent = message;
+            this.statusDiv.className = `status ${type}`;
+        }
+
+        // Simulación con imagen sintética
+        simulate() {
+            const w = 640, h = 400;
+            const canvas = document.createElement('canvas');
+            canvas.width = w; canvas.height = h;
+            const ctx = canvas.getContext('2d');
+            ctx.fillStyle = '#fff';
+            ctx.fillRect(0, 0, w, h);
+            ctx.fillStyle = '#000';
+            ctx.font = '20px serif';
+            ctx.fillText('Documento simulado', 30, 50);
+            ctx.fillText('Con texto y un recuadro:', 30, 80);
+            ctx.strokeStyle = '#000';
+            ctx.lineWidth = 2;
+            ctx.strokeRect(30, 100, 200, 60);
+            ctx.font = '16px sans-serif';
+            ctx.fillText('Texto dentro del recuadro', 40, 130);
+            const imageData = ctx.getImageData(0, 0, w, h);
+            const dataURL = canvas.toDataURL();
+            this.onImageLoaded({ imageData, dataURL });
+            this.setStatus('Imagen de muestra cargada.', 'ok');
+        }
+    }
+
+    // Arranque
+    const app = new UIController();
+    </script>
+</body>
+</html>
